@@ -60,16 +60,40 @@ void Request::parseKey(const KeyOpFieldsValuesTuple& request)
 
     // split the key by separator
     std::vector<std::string> key_items;
-    size_t f_position = 0;
-    size_t e_position = full_key_.find(key_separator_);
-    while (e_position != std::string::npos)
+    size_t key_item_start = 0;
+    size_t key_item_end = full_key_.find(key_separator_);
+    while (key_item_end != std::string::npos)
     {
-        key_items.push_back(full_key_.substr(f_position, e_position - f_position));
-        f_position = e_position + 1;
-        e_position = full_key_.find(key_separator_, f_position);
+        key_items.push_back(full_key_.substr(key_item_start, key_item_end - key_item_start));
+        key_item_start = key_item_end + 1;
+        key_item_end = full_key_.find(key_separator_, key_item_start);
     }
-    key_items.push_back(full_key_.substr(f_position, full_key_.length()));
+    key_items.push_back(full_key_.substr(key_item_start, full_key_.length()));
 
+    if (key_separator_ == ':' and 
+        key_items.size() > number_of_key_items_ and 
+        (request_description_.key_item_types.back() == REQ_T_IP or request_description_.key_item_types.back() == REQ_T_IP_PREFIX))
+    {
+        // If we have too many key items and the last key item is supposed to be an IP or prefix, there is a chance that it was an IPv6 address that got segmented during parsing
+        // Remove key_items so that key_items.size() is correct, then assemble the removed items into an IPv6 address
+        // This runs under the assumption that an IPv6 address, if present, will always be the last key item
+        std::vector<std::string> ip_addr_groups(--key_items.begin() + number_of_key_items_, key_items.end());
+        key_items.erase(--key_items.begin() + number_of_key_items_, key_items.end());
+
+        std::string ip_string;
+
+        for (std::vector<std::string>::const_iterator i = ip_addr_groups.begin(); i != ip_addr_groups.end(); i++)
+        {
+            ip_string += *i;
+
+            if (i != --ip_addr_groups.end())
+            {
+                ip_string += ":";
+            }
+        }
+
+        key_items.push_back(ip_string);
+    }
     if (key_items.size() != number_of_key_items_)
     {
         throw std::invalid_argument(std::string("Wrong number of key items. Expected ")
