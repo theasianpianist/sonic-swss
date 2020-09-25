@@ -1347,9 +1347,9 @@ public:
     TestRequestIpv6PrefixOnly() : Request(request_desc_ipv6_prefix_only, ':') { }
 };
 
-std::vector<std::string> ipv6_addresses = {"2001:db8:3c4d:0015:0000:0000:1a2f:1a2b", "2001:db8:3c4d:0015::1a2f:1a2b", "::2001:db8:3c4d:0015:1a2f:1a2b", "2001:db8:3c4d:0015:1a2f:1a2b::"};
+std::vector<std::string> ipv6_addresses = {"2001:db8:3c4d:0015:0000:0000:1a2f:1a2b", "2001:db8:3c4d:0015::1a2f:1a2b", "::2001:db8:3c4d:0015:1a2f:1a2b", "2001:db8:3c4d:0015:1a2f:1a2b::", "::"};
 std::vector<std::string> ipv6_addresses_invalid = {"2001:db8:0015:0000:1a2f:1a2b", "5552001:db8:3c4d:0015::1a2f:1a2b", "::2001:zdb8:3c4d:0015:1a2f:1a2b", "2001:db8:3c4d:0015::::1a2f:1aeer2b::"};
-std::vector<std::string> ipv6_prefixes = {"2001:db8:3c4d:0015:0000:0000:1a2f:1a2b/16", "2001:db8:3c4d:0015::1a2f:1a2b/32", "::2001:db8:3c4d:0015:1a2f:1a2b/24", "2001:db8:3c4d:0015:1a2f:1a2b::/8"};
+std::vector<std::string> ipv6_prefixes = {"2001:db8:3c4d:0015:0000:0000:1a2f:1a2b/16", "2001:db8:3c4d:0015::1a2f:1a2b/32", "::2001:db8:3c4d:0015:1a2f:1a2b/24", "2001:db8:3c4d:0015:1a2f:1a2b::/8", "::/16"};
 std::vector<std::string> ipv6_prefixes_invalid = {"2001:db8:0015:0000:1a2f:1a2b/16", "5552001:db8:3c4d:0015::1a2f:1a2b/32", "::2001:zdb8:3c4d:0015:1a2f:1a2b/24", "2001:db8:3c4d:0015::::1a2f:1aeer2b::/8"};
 
 TEST(request_parser, ipv6_addr_key_item)
