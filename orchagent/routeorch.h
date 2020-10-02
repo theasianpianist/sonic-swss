@@ -12,7 +12,7 @@
 #include "ipprefix.h"
 #include "nexthopgroupkey.h"
 #include "bulker.h"
-#include "fgnhgorch.h"
+
 #include <map>
 
 /* Maximum next hop group number */
@@ -89,7 +89,7 @@ struct RouteBulkContext
 class RouteOrch : public Orch, public Subject
 {
 public:
-    RouteOrch(DBConnector *db, string tableName, SwitchOrch *switchOrch, NeighOrch *neighOrch, IntfsOrch *intfsOrch, VRFOrch *vrfOrch, FgNhgOrch *fgNhgOrch);
+    RouteOrch(DBConnector *db, string tableName, SwitchOrch *switchOrch, NeighOrch *neighOrch, IntfsOrch *intfsOrch, VRFOrch *vrfOrch);
 
     bool hasNextHopGroup(const NextHopGroupKey&) const;
     sai_object_id_t getNextHopGroupId(const NextHopGroupKey&);
@@ -108,16 +108,11 @@ public:
     bool invalidnexthopinNextHopGroup(const NextHopKey&);
 
     void notifyNextHopChangeObservers(sai_object_id_t, const IpPrefix&, const NextHopGroupKey&, bool);
-    const NextHopGroupKey getSyncdRouteNhgKey(sai_object_id_t vrf_id, const IpPrefix& ipPrefix);
-    bool createFineGrainedNextHopGroup(sai_object_id_t &next_hop_group_id, vector<sai_attribute_t> &nhg_attrs);
-    bool removeFineGrainedNextHopGroup(sai_object_id_t &next_hop_group_id);
-
 private:
     SwitchOrch *m_switchOrch;
     NeighOrch *m_neighOrch;
     IntfsOrch *m_intfsOrch;
     VRFOrch *m_vrfOrch;
-    FgNhgOrch *m_fgNhgOrch;
 
     int m_nextHopGroupCount;
     int m_maxNextHopGroupCount;
@@ -133,8 +128,8 @@ private:
 
     void addTempRoute(RouteBulkContext& ctx, const NextHopGroupKey&);
     bool addRoute(RouteBulkContext& ctx, const NextHopGroupKey&);
-    bool removeRoute(RouteBulkContext& ctx);
     bool addRoutePost(const RouteBulkContext& ctx, const NextHopGroupKey &nextHops);
+    bool removeRoute(RouteBulkContext& ctx);
     bool removeRoutePost(const RouteBulkContext& ctx);
 
     std::string getLinkLocalEui64Addr(void);
