@@ -441,7 +441,7 @@ bool DashRouteOrch::addInboundRouting(const string& key, InboundRoutingBulkConte
     inbound_routing_entry.vni = ctxt.vni;
     swss::copy(inbound_routing_entry.sip, ctxt.sip);
     swss::copy(inbound_routing_entry.sip_mask, ctxt.sip_mask);
-    inbound_routing_entry.priority = ctxt.metadata.priority();
+    inbound_routing_entry.priority = ctxt.priority;
     auto& object_statuses = ctxt.object_statuses;
 
     sai_attribute_t inbound_routing_attr;
@@ -523,7 +523,7 @@ bool DashRouteOrch::removeInboundRouting(const string& key, InboundRoutingBulkCo
     inbound_routing_entry.vni = ctxt.vni;
     swss::copy(inbound_routing_entry.sip, ctxt.sip);
     swss::copy(inbound_routing_entry.sip_mask, ctxt.sip_mask);
-    inbound_routing_entry.priority = ctxt.metadata.priority();
+    inbound_routing_entry.priority = ctxt.priority;
     object_statuses.emplace_back();
     inbound_routing_bulker_.remove_entry(&object_statuses.back(), &inbound_routing_entry);
 
@@ -596,14 +596,20 @@ void DashRouteOrch::doTaskRouteRuleTable(ConsumerBase& consumer)
             uint32_t& vni = ctxt.vni;
             IpAddress& sip = ctxt.sip;
             IpAddress& sip_mask = ctxt.sip_mask;
+            uint32_t& priority = ctxt.priority;
             IpPrefix prefix;
 
+            // expect key in format {{eni}}:{{vni}}:{{prefix/tag}}:{{priority}}
             vector<string> keys = tokenize(key, ':');
             eni = keys[0];
             vni = to_uint<uint32_t>(keys[1]);
+            priority = to_uint<uint32_t>(keys.back());
             string ip_str;
-            size_t pos = key.find(":", keys[0].length() + keys[1].length() + 1);
-            ip_str = key.substr(pos + 1);
+            size_t strlen_before_prefix = keys[0].length() + keys[1].length() + 1; // + 1 for the colon between eni and vni
+            size_t strlen_after_prefix = keys.back().length() + 1; // + 1 for the colon between prefix and priority
+            size_t prefix_strlen = key.length() - strlen_before_prefix - strlen_after_prefix - 1; // - 1 for the colon before prefix since the below substr function starts after the colon
+            size_t pos = key.find(":", strlen_before_prefix);
+            ip_str = key.substr(pos + 1, prefix_strlen);
             prefix = IpPrefix(ip_str);
 
             sip = prefix.getIp();
