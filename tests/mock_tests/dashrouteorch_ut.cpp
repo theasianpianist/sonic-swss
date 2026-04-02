@@ -18,7 +18,6 @@
 EXTERN_MOCK_FNS
 namespace dashrouteorch_test
 {
-    void VerifyInboundRoutingAction(std::vector<sai_attribute_t> &actual_attrs, bool &retFlag);
     DEFINE_SAI_API_MOCK(dash_outbound_routing, outbound_routing);
     DEFINE_SAI_API_MOCK(dash_inbound_routing, inbound_routing);
     using namespace mock_orch_test;
@@ -27,7 +26,7 @@ namespace dashrouteorch_test
     using ::testing::SaveArgPointee;
     using ::testing::Invoke;
 
-    class DashRouteOrchTest : public MockDashOrchTest, public ::testing::WithParamInterface<std::tuple<swss::IpPrefix, uint32_t>>
+    class DashRouteOrchTest : public MockDashOrchTest, public ::testing::WithParamInterface<std::tuple<swss::IpPrefix, int>>
     {
         void PostSetUp()
         {
@@ -141,10 +140,10 @@ namespace dashrouteorch_test
         DashRouteOrchTest,
         ::testing::Combine(
             ::testing::Values(swss::IpPrefix("100.200.1.2/32"), swss::IpPrefix("2001:db8::1/128")),
-            ::testing::Values<int>(0, 101, -1)), // Use -1 to test the case where priority is not set and should default to 0
+            ::testing::Values(0, 101, -1)), // Use -1 to test the case where priority is not set and should default to 0
         [](const testing::TestParamInfo<DashRouteOrchTest::ParamType> &info) {
             const auto &prefix = std::get<0>(info.param);
-            const int &priority = std::get<1>(info.param);
+            const auto &priority = std::get<1>(info.param);
             const std::string addr_family = prefix.isV4() ? "IPv4" : "IPv6";
             const std::string priority_str = (priority >= 0) ? std::to_string(priority) : "None";
             return "InboundRouting_" + addr_family + "_Priority_" + priority_str;
