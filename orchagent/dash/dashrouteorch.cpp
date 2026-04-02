@@ -4,6 +4,7 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <exception>
+#include <cctype>
 #include <inttypes.h>
 #include <algorithm>
 #include <numeric>
@@ -600,16 +601,30 @@ void DashRouteOrch::doTaskRouteRuleTable(ConsumerBase& consumer)
             IpPrefix prefix;
 
             // expect key in format {{eni}}:{{vni}}:{{prefix/tag}}:{{priority}}
-            vector<string> keys = tokenize(key, ':');
-            eni = keys[0];
-            vni = to_uint<uint32_t>(keys[1]);
-            priority = to_uint<uint32_t>(keys.back());
-            string ip_str;
-            size_t strlen_before_prefix = keys[0].length() + keys[1].length() + 1; // + 1 for the colon between eni and vni
-            size_t strlen_after_prefix = keys.back().length() + 1; // + 1 for the colon between prefix and priority
-            size_t prefix_strlen = key.length() - strlen_before_prefix - strlen_after_prefix - 1; // - 1 for the colon before prefix since the below substr function starts after the colon
-            size_t pos = key.find(":", strlen_before_prefix);
-            ip_str = key.substr(pos + 1, prefix_strlen);
+            size_t first_colon = key.find(":");
+            size_t second_colon = key.find(":", first_colon == string::npos ? first_colon : first_colon + 1);
+            eni = key.substr(0, first_colon);
+            vni = to_uint<uint32_t>(key.substr(first_colon + 1, second_colon - first_colon - 1));
+
+            priority = 0;
+
+            // the key format was changed to include priority field. in case old key format is used where the priority is not present, we should not crash and default to priority 0.
+            string prefix_and_optional_priority = key.substr(second_colon + 1);
+            string ip_str = prefix_and_optional_priority;
+            size_t last_colon = prefix_and_optional_priority.rfind(':');
+            if (last_colon != string::npos)
+            {
+                string maybe_priority = prefix_and_optional_priority.substr(last_colon + 1);
+                bool is_priority = !maybe_priority.empty() &&
+                                   all_of(maybe_priority.begin(), maybe_priority.end(),
+                                          [](unsigned char c)
+                                          { return std::isdigit(c); });
+                if (is_priority)
+                {
+                    priority = to_uint<uint32_t>(maybe_priority);
+                    ip_str = prefix_and_optional_priority.substr(0, last_colon);
+                }
+            }
             prefix = IpPrefix(ip_str);
 
             sip = prefix.getIp();

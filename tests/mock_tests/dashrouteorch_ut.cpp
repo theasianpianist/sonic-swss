@@ -96,6 +96,7 @@ namespace dashrouteorch_test
         swss::IpPrefix prefix;
         int priority;
         std::tie(prefix, priority) = GetParam();
+        uint32_t expected_priority = priority >= 0 ? static_cast<uint32_t>(priority) : 0;
 
         sai_inbound_routing_entry_t created_entry;
         sai_inbound_routing_entry_t removed_entry;
@@ -122,14 +123,17 @@ namespace dashrouteorch_test
                 );
         }
         std::stringstream key_stream;
-        key_stream << eni1 << ":" << vni << ":" << prefix.to_string() << ":" << priority;
+        if (priority >= 0)
+            key_stream << eni1 << ":" << vni << ":" << prefix.to_string() << ":" << priority;
+        else
+            key_stream << eni1 << ":" << vni << ":" << prefix.to_string();
         SetDashTable(APP_DASH_ROUTE_RULE_TABLE_NAME, key_stream.str(), dash::route_rule::RouteRule());
 
-        VerifyInboundRoutingEntry(created_entry, vni, prefix, priority);
+        VerifyInboundRoutingEntry(created_entry, vni, prefix, expected_priority);
         VerifyInboundRoutingAction(actual_attrs, SAI_INBOUND_ROUTING_ENTRY_ACTION_TUNNEL_DECAP);
 
         SetDashTable(APP_DASH_ROUTE_RULE_TABLE_NAME, key_stream.str(), dash::route_rule::RouteRule(), false);
-        VerifyInboundRoutingEntry(removed_entry, vni, prefix, priority);
+        VerifyInboundRoutingEntry(removed_entry, vni, prefix, expected_priority);
     }
 
     INSTANTIATE_TEST_SUITE_P(
@@ -137,12 +141,12 @@ namespace dashrouteorch_test
         DashRouteOrchTest,
         ::testing::Combine(
             ::testing::Values(swss::IpPrefix("100.200.1.2/32"), swss::IpPrefix("2001:db8::1/128")),
-            ::testing::Values(0, 101)),
+            ::testing::Values<int>(0, 101, -1)), // Use -1 to test the case where priority is not set and should default to 0
         [](const testing::TestParamInfo<DashRouteOrchTest::ParamType> &info) {
             const auto &prefix = std::get<0>(info.param);
-            const auto &priority = std::get<1>(info.param);
+            const int &priority = std::get<1>(info.param);
             const std::string addr_family = prefix.isV4() ? "IPv4" : "IPv6";
-            return "InboundRouting_" + addr_family + "_Priority" + std::to_string(priority);
-        }
-    );
+            const std::string priority_str = (priority >= 0) ? std::to_string(priority) : "None";
+            return "InboundRouting_" + addr_family + "_Priority_" + priority_str;
+        });
 }
