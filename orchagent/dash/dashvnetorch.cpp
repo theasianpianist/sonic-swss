@@ -63,8 +63,8 @@ bool DashVnetOrch::addVnet(const string& vnet_name, DashVnetBulkContext& ctxt)
     DashOrch* dash_orch = gDirectory.get<DashOrch*>();
     if (!dash_orch->hasApplianceEntry())
     {
-        SWSS_LOG_INFO("Retry as no appliance table entry found");
-        return false;
+        SWSS_LOG_ERROR("Failed to create vnet entry for %s: no appliance table entry found", vnet_name.c_str());
+        return true;
     }
 
     uint32_t attr_count = 1;
@@ -93,7 +93,7 @@ bool DashVnetOrch::addVnetPost(const string& vnet_name, const DashVnetBulkContex
     if (id == SAI_NULL_OBJECT_ID)
     {
         SWSS_LOG_ERROR("Failed to create vnet entry for %s", vnet_name.c_str());
-        return false;
+        return true;
     }
 
     VnetEntry entry = { id, ctxt.metadata, std::set<std::string>() };
@@ -148,16 +148,17 @@ bool DashVnetOrch::removeVnetPost(const string& vnet_name, const DashVnetBulkCon
     sai_status_t status = *it_status++;
     if (status != SAI_STATUS_SUCCESS)
     {
-        // Retry later if object has non-zero reference to it
         if (status == SAI_STATUS_NOT_EXECUTED)
         {
-            return false;
+            SWSS_LOG_ERROR("Failed to remove vnet entry for %s: object remove was not executed", vnet_name.c_str());
+            return true;
         }
         SWSS_LOG_ERROR("Failed to remove vnet entry for %s", vnet_name.c_str());
         task_process_status handle_status = handleSaiRemoveStatus((sai_api_t) SAI_API_DASH_VNET, status);
         if (handle_status != task_success)
         {
-            return parseHandleSaiStatusFailure(handle_status);
+            parseHandleSaiStatusFailure(handle_status);
+            return true;
         }
     }
 
@@ -210,10 +211,7 @@ void DashVnetOrch::doTaskVnetTable(ConsumerBase& consumer)
                 if (addVnet(key, vnet_ctxt))
                 {
                     it = consumer.m_toSync.erase(it);
-                    /*
-                     * Write result only when removing from consumer in pre-op
-                     * For other cases, this will be handled in post-op
-                     */
+                    result = DASH_RESULT_FAILURE;
                     writeResultToDB(dash_vnet_result_table_, key, result);
                 }
                 else
@@ -226,7 +224,6 @@ void DashVnetOrch::doTaskVnetTable(ConsumerBase& consumer)
                 if (removeVnet(key, vnet_ctxt))
                 {
                     it = consumer.m_toSync.erase(it);
-                    removeResultFromDB(dash_vnet_result_table_, key);
                 }
                 else
                 {
@@ -265,34 +262,29 @@ void DashVnetOrch::doTaskVnetTable(ConsumerBase& consumer)
 
             if (object_ids.empty() && vnet_statuses.empty() && pa_validation_statuses.empty())
             {
-                it_prev++;
+                SWSS_LOG_ERROR("No bulk results found for VNET %s %s", op.c_str(), key.c_str());
+                result = DASH_RESULT_FAILURE;
+                writeResultToDB(dash_vnet_result_table_, key, result);
+                it_prev = consumer.m_toSync.erase(it_prev);
                 continue;
             }
 
             if (op == SET_COMMAND)
             {
-               if (addVnetPost(key, vnet_ctxt))
-                {
-                    it_prev = consumer.m_toSync.erase(it_prev);
-                }
-                else
+               if (!addVnetPost(key, vnet_ctxt))
                 {
                     result = DASH_RESULT_FAILURE;
-                    it_prev++;
                 }
+                it_prev = consumer.m_toSync.erase(it_prev);
                 writeResultToDB(dash_vnet_result_table_, key, result);
             }
             else if (op == DEL_COMMAND)
             {
                if (removeVnetPost(key, vnet_ctxt))
                 {
-                    it_prev = consumer.m_toSync.erase(it_prev);
                     removeResultFromDB(dash_vnet_result_table_, key);
                 }
-                else
-                {
-                    it_prev++;
-                }
+                it_prev = consumer.m_toSync.erase(it_prev);
             }
         }
     }
@@ -314,8 +306,8 @@ bool DashVnetOrch::addOutboundCaToPa(const string& key, VnetMapBulkContext& ctxt
     dash::route_type::RouteType route_type_actions;
     if (!dash_orch->getRouteTypeActions(ctxt.metadata.routing_type(), route_type_actions))
     {
-        SWSS_LOG_INFO("Failed to get route type actions for %s", key.c_str());
-        return false;
+        SWSS_LOG_ERROR("Failed to get route type actions for %s", key.c_str());
+        return true;
     }
 
     uint32_t routing_type_tunnel_key = 0;
@@ -356,8 +348,8 @@ bool DashVnetOrch::addOutboundCaToPa(const string& key, VnetMapBulkContext& ctxt
         auto tunnel_oid = gDirectory.get<DashTunnelOrch*>()->getTunnelOid(ctxt.metadata.tunnel());
         if (tunnel_oid == SAI_NULL_OBJECT_ID)
         {
-            SWSS_LOG_INFO("Tunnel %s for VnetMap %s does not exist yet", ctxt.metadata.tunnel().c_str(), key.c_str());
-            return false;
+            SWSS_LOG_ERROR("Tunnel %s for VnetMap %s does not exist", ctxt.metadata.tunnel().c_str(), key.c_str());
+            return true;
         }
         outbound_ca_to_pa_attr.id = SAI_OUTBOUND_CA_TO_PA_ENTRY_ATTR_DASH_TUNNEL_ID;
         outbound_ca_to_pa_attr.value.oid = tunnel_oid;
@@ -412,9 +404,9 @@ bool DashVnetOrch::addOutboundCaToPa(const string& key, VnetMapBulkContext& ctxt
                 gDirectory.get<DashPortMapOrch*>()->getPortMapOid(ctxt.metadata.port_map());
             if (port_map_oid == SAI_NULL_OBJECT_ID)
             {
-                SWSS_LOG_ERROR("Portmap %s for VnetMap %s does not exist yet",
+                SWSS_LOG_ERROR("Portmap %s for VnetMap %s does not exist",
                                ctxt.metadata.port_map().c_str(), key.c_str());
-                return false;
+                return true;
             }
             outbound_ca_to_pa_attr.id = SAI_OUTBOUND_CA_TO_PA_ENTRY_ATTR_OUTBOUND_PORT_MAP_ID;
             outbound_ca_to_pa_attr.value.oid = port_map_oid;
@@ -489,8 +481,8 @@ bool DashVnetOrch::addVnetMap(const string& key, VnetMapBulkContext& ctxt)
     bool vnet_exists = (gVnetNameToId.find(ctxt.vnet_name) != gVnetNameToId.end());
     if (!vnet_exists)
     {
-        SWSS_LOG_INFO("Not creating VNET map for %s since VNET %s doesn't exist", key.c_str(), ctxt.vnet_name.c_str());
-        return false;
+        SWSS_LOG_ERROR("Not creating VNET map for %s since VNET %s doesn't exist", key.c_str(), ctxt.vnet_name.c_str());
+        return true;
     }
     return addOutboundCaToPa(key, ctxt);
 }
@@ -518,7 +510,8 @@ bool DashVnetOrch::addOutboundCaToPaPost(const string& key, const VnetMapBulkCon
         task_process_status handle_status = handleSaiCreateStatus((sai_api_t) SAI_API_DASH_OUTBOUND_CA_TO_PA, status);
         if (handle_status != task_success)
         {
-            return parseHandleSaiStatusFailure(handle_status);
+            parseHandleSaiStatusFailure(handle_status);
+            return true;
         }
     }
 
@@ -554,7 +547,8 @@ bool DashVnetOrch::addPaValidationPost(const string& key, const VnetMapBulkConte
         task_process_status handle_status = handleSaiCreateStatus((sai_api_t) SAI_API_DASH_PA_VALIDATION, status);
         if (handle_status != task_success)
         {
-            return parseHandleSaiStatusFailure(handle_status);
+            parseHandleSaiStatusFailure(handle_status);
+            return true;
         }
     }
 
@@ -639,10 +633,10 @@ bool DashVnetOrch::removeOutboundCaToPaPost(const string& key, const VnetMapBulk
     sai_status_t status = *it_status++;
     if (status != SAI_STATUS_SUCCESS)
     {
-        // Retry later if object has non-zero reference to it
         if (status == SAI_STATUS_NOT_EXECUTED)
         {
-            return false;
+            SWSS_LOG_ERROR("Failed to remove outbound CA to PA entry for %s: object remove was not executed", key.c_str());
+            return true;
         }
 
         if (status == SAI_STATUS_ITEM_NOT_FOUND)
@@ -655,7 +649,8 @@ bool DashVnetOrch::removeOutboundCaToPaPost(const string& key, const VnetMapBulk
         task_process_status handle_status = handleSaiRemoveStatus((sai_api_t) SAI_API_DASH_OUTBOUND_CA_TO_PA, status);
         if (handle_status != task_success)
         {
-            return parseHandleSaiStatusFailure(handle_status);
+            parseHandleSaiStatusFailure(handle_status);
+            return true;
         }
     }
 
@@ -685,12 +680,10 @@ bool DashVnetOrch::removePaValidationPost(const string& key, const DashVnetBulkC
         swss::IpAddress underlay_ip(*it_ip);
         if (status != SAI_STATUS_SUCCESS)
         {
-            // Retry later if object has non-zero reference to it
             if (status == SAI_STATUS_OBJECT_IN_USE)
             {
-                SWSS_LOG_INFO("PA validation entry for Vnet %s IP %s still in use",
+                SWSS_LOG_ERROR("PA validation entry for Vnet %s IP %s still in use",
                                 ctxt.vnet_name.c_str(), it_ip->c_str());
-                remove_from_consumer = false;
                 it_ip++;
                 continue;
             }
@@ -781,10 +774,7 @@ void DashVnetOrch::doTaskVnetMapTable(ConsumerBase& consumer)
                 if (addVnetMap(key, ctxt))
                 {
                     it = consumer.m_toSync.erase(it);
-                    /*
-                     * Write result only when removing from consumer in pre-op
-                     * For other cases, this will be handled in post-op
-                     */
+                    result = DASH_RESULT_FAILURE;
                     writeResultToDB(dash_vnet_map_result_table_, key, result);
                 }
                 else
@@ -797,7 +787,6 @@ void DashVnetOrch::doTaskVnetMapTable(ConsumerBase& consumer)
                 if (removeVnetMap(key, ctxt))
                 {
                     it = consumer.m_toSync.erase(it);
-                    removeResultFromDB(dash_vnet_map_result_table_, key);
                 }
                 else
                 {
@@ -833,34 +822,29 @@ void DashVnetOrch::doTaskVnetMapTable(ConsumerBase& consumer)
             const auto& pa_validation_object_statuses = ctxt.pa_validation_object_statuses;
             if (outbound_ca_to_pa_object_statuses.empty() && pa_validation_object_statuses.empty())
             {
-                it_prev++;
+                SWSS_LOG_ERROR("No bulk results found for VNET map %s %s", op.c_str(), key.c_str());
+                result = DASH_RESULT_FAILURE;
+                writeResultToDB(dash_vnet_map_result_table_, key, result);
+                it_prev = consumer.m_toSync.erase(it_prev);
                 continue;
             }
 
             if (op == SET_COMMAND)
             {
-                if (addVnetMapPost(key, ctxt))
-                {
-                    it_prev = consumer.m_toSync.erase(it_prev);
-                }
-                else
+                if (!addVnetMapPost(key, ctxt))
                 {
                     result = DASH_RESULT_FAILURE;
-                    it_prev++;
                 }
+                it_prev = consumer.m_toSync.erase(it_prev);
                 writeResultToDB(dash_vnet_map_result_table_, key, result);
             }
             else if (op == DEL_COMMAND)
             {
                 if (removeVnetMapPost(key, ctxt))
                 {
-                    it_prev = consumer.m_toSync.erase(it_prev);
                     removeResultFromDB(dash_vnet_map_result_table_, key);
                 }
-                else
-                {
-                    it_prev++;
-                }
+                it_prev = consumer.m_toSync.erase(it_prev);
             }
         }
     }

@@ -196,7 +196,7 @@ bool DashMeterOrch::addMeterPolicy(const string& meter_policy, MeterPolicyContex
         task_process_status handle_status = handleSaiCreateStatus((sai_api_t) SAI_API_DASH_METER, status);
         if (handle_status != task_success)
         {
-            return parseHandleSaiStatusFailure(handle_status);
+            return true;
         }
     }
 
@@ -213,8 +213,8 @@ bool DashMeterOrch::removeMeterPolicy(const string& meter_policy)
 
     if (isMeterPolicyBound(meter_policy))
     {
-        SWSS_LOG_WARN("Cannot remove bound meter policy %s", meter_policy.c_str());
-        return false;
+        SWSS_LOG_ERROR("Cannot remove bound meter policy %s", meter_policy.c_str());
+        return true;
     }
 
     sai_object_id_t meter_policy_oid = getMeterPolicyOid(meter_policy);
@@ -238,7 +238,7 @@ bool DashMeterOrch::removeMeterPolicy(const string& meter_policy)
         task_process_status handle_status = handleSaiRemoveStatus((sai_api_t) SAI_API_DASH_METER, status);
         if (handle_status != task_success)
         {
-            return parseHandleSaiStatusFailure(handle_status);
+            return true;
         }
     }
 
@@ -272,25 +272,19 @@ void DashMeterOrch::doTaskMeterPolicyTable(ConsumerBase& consumer)
                 it = consumer.m_toSync.erase(it);
                 continue;
             }
-            if (addMeterPolicy(key, ctxt))
+            if (!addMeterPolicy(key, ctxt))
             {
-                it = consumer.m_toSync.erase(it);
+                SWSS_LOG_ERROR("Failed to process meter policy %s", key.c_str());
             }
-            else
-            {
-                it++;
-            }
+            it = consumer.m_toSync.erase(it);
         }
         else if (op == DEL_COMMAND)
         {
-            if (removeMeterPolicy(key))
+            if (!removeMeterPolicy(key))
             {
-                it = consumer.m_toSync.erase(it);
+                SWSS_LOG_ERROR("Failed to remove meter policy %s", key.c_str());
             }
-            else
-            {
-                it++;
-            }
+            it = consumer.m_toSync.erase(it);
         }
         else
         {
@@ -321,8 +315,8 @@ bool DashMeterOrch::addMeterRule(const string& key, MeterRuleBulkContext& ctxt)
     sai_object_id_t meter_policy_oid = getMeterPolicyOid(ctxt.meter_policy);
     if (meter_policy_oid == SAI_NULL_OBJECT_ID)
     {
-        SWSS_LOG_INFO("Retry for rule %s as meter policy %s not found", key.c_str(), ctxt.meter_policy.c_str());
-        return false;
+        SWSS_LOG_ERROR("Meter policy %s not found for rule %s", ctxt.meter_policy.c_str(), key.c_str());
+        return true;
     }
 
     auto& object_ids = ctxt.object_ids;
@@ -370,7 +364,7 @@ bool DashMeterOrch::addMeterRulePost(const string& key, const MeterRuleBulkConte
     if (id == SAI_NULL_OBJECT_ID)
     {
         SWSS_LOG_ERROR("Failed to create meter rule entry for %s", key.c_str());
-        return false;
+        return true;
     }
 
     meter_rule_entries_[key] = { id, ctxt.metadata, ctxt.meter_policy, ctxt.rule_num };
@@ -423,13 +417,14 @@ bool DashMeterOrch::removeMeterRulePost(const string& key, const MeterRuleBulkCo
         // Retry later if object has non-zero reference to it
         if (status == SAI_STATUS_NOT_EXECUTED)
         {
-            return false;
+            SWSS_LOG_ERROR("Failed to remove meter rule entry for %s, dropping notification", key.c_str());
+            return true;
         }
         SWSS_LOG_ERROR("Failed to remove meter rule entry for %s", key.c_str());
         task_process_status handle_status = handleSaiRemoveStatus((sai_api_t) SAI_API_DASH_METER, status);
         if (handle_status != task_success)
         {
-            return parseHandleSaiStatusFailure(handle_status);
+            return true;
         }
     }
 
@@ -537,35 +532,31 @@ void DashMeterOrch::doTaskMeterRuleTable(ConsumerBase& consumer)
             {
                 if (object_ids.empty())
                 {
-                    it_prev++;
+                    SWSS_LOG_ERROR("Missing meter rule create results for %s", key.c_str());
+                    it_prev = consumer.m_toSync.erase(it_prev);
                     continue;
                 }
 
-                if (addMeterRulePost(key, ctxt))
+                if (!addMeterRulePost(key, ctxt))
                 {
-                    it_prev = consumer.m_toSync.erase(it_prev);
+                    SWSS_LOG_ERROR("Failed post-processing meter rule %s", key.c_str());
                 }
-                else
-                {
-                    it_prev++;
-                }
+                it_prev = consumer.m_toSync.erase(it_prev);
             }
             else if (op == DEL_COMMAND)
             {
                 if (object_statuses.empty())
                 {
-                    it_prev++;
+                    SWSS_LOG_ERROR("Missing meter rule remove results for %s", key.c_str());
+                    it_prev = consumer.m_toSync.erase(it_prev);
                     continue;
                 }
 
-                if (removeMeterRulePost(key, ctxt))
+                if (!removeMeterRulePost(key, ctxt))
                 {
-                    it_prev = consumer.m_toSync.erase(it_prev);
+                    SWSS_LOG_ERROR("Failed post-processing meter rule removal %s", key.c_str());
                 }
-                else
-                {
-                    it_prev++;
-                }
+                it_prev = consumer.m_toSync.erase(it_prev);
             }
         }
     }

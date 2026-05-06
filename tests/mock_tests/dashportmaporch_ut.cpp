@@ -189,7 +189,7 @@ namespace dashportmaporch_test
         key_stream << port_map1 << ":" << port_map1_start_port << "-" << port_map1_end_port;
         std::string key = key_stream.str();
         EXPECT_CALL(*mock_sai_dash_outbound_port_map_api, create_outbound_port_map_port_range_entries).Times(0);
-        SetDashTable(APP_DASH_OUTBOUND_PORT_MAP_RANGE_TABLE_NAME, key, port_map_range, true, false);
+        SetDashTable(APP_DASH_OUTBOUND_PORT_MAP_RANGE_TABLE_NAME, key, port_map_range, true, true);
     }
 
     TEST_F(DashPortMapOrchTest, RemoveInUsePortMap)
@@ -205,6 +205,6 @@ namespace dashportmaporch_test
         SetDashTable(APP_DASH_OUTBOUND_PORT_MAP_TABLE_NAME, port_map1, dash::outbound_port_map::OutboundPortMap());
         SetDashTable(APP_DASH_OUTBOUND_PORT_MAP_RANGE_TABLE_NAME, port_map_range_key, port_map_range);
 
-        SetDashTable(APP_DASH_OUTBOUND_PORT_MAP_TABLE_NAME, port_map1, dash::outbound_port_map::OutboundPortMap(), false, false);
+        SetDashTable(APP_DASH_OUTBOUND_PORT_MAP_TABLE_NAME, port_map1, dash::outbound_port_map::OutboundPortMap(), false, true);
     }
 }

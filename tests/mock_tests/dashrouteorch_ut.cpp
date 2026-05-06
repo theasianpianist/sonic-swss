@@ -93,7 +93,7 @@ namespace dashrouteorch_test
             EXPECT_CALL(*mock_sai_dash_outbound_routing_api, create_outbound_routing_entries).Times(1);
         }
         AddOutboundRoutingGroup();
-        AddOutboundRoutingEntry(false);
+        AddOutboundRoutingEntry(true);
         
         AddTunnel();
         AddOutboundRoutingEntry();

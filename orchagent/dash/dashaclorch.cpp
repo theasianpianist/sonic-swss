@@ -133,32 +133,21 @@ void DashAclOrch::doTask(ConsumerBase &consumer)
                 op.c_str());
         }
 
-        if (task_status == task_need_retry)
+        if (task_status != task_success)
         {
-            SWSS_LOG_DEBUG(
-                "Task %s - %s need retry",
-                table_name.c_str(),
-                op.c_str());
-            ++itr;
+            SWSS_LOG_ERROR("Task %s - %s failed",
+                          table_name.c_str(),
+                          op.c_str());
         }
         else
         {
-            if (task_status != task_success)
-            {
-                SWSS_LOG_WARN("Task %s - %s fail",
-                              table_name.c_str(),
-                              op.c_str());
-            }
-            else
-            {
-                SWSS_LOG_DEBUG(
-                    "Task %s - %s success",
-                    table_name.c_str(),
-                    op.c_str());
-            }
-
-            itr = consumer.m_toSync.erase(itr);
+            SWSS_LOG_DEBUG(
+                "Task %s - %s success",
+                table_name.c_str(),
+                op.c_str());
         }
+
+        itr = consumer.m_toSync.erase(itr);
     }
 }
 

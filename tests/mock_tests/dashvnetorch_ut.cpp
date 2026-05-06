@@ -102,7 +102,7 @@ namespace dashvnetorch_test
         EXPECT_CALL(*mock_sai_dash_pa_validation_api, create_pa_validation_entries)
             .Times(0);
         AddVnetEncapRoutingType(dash::route_type::ENCAP_TYPE_VXLAN);
-        AddVnetMap(false);
+        AddVnetMap(true);
     }
 
     TEST_F(DashVnetOrchTest, AddExistingOutboundCaToPaSuccessful)
@@ -165,7 +165,7 @@ namespace dashvnetorch_test
 
         EXPECT_CALL(*mock_sai_dash_pa_validation_api, remove_pa_validation_entries)
             .Times(1).WillOnce(DoAll(SetArrayArgument<3>(exp_status.begin(), exp_status.end()), Return(SAI_STATUS_SUCCESS)));
-        RemoveVnet(false);
+        RemoveVnet(true);
 
         int actualUsed = GetCrmUsedCount(CrmResourceType::CRM_DASH_IPV4_PA_VALIDATION);
         EXPECT_EQ(expectedUsed, actualUsed);

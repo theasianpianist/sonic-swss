@@ -320,7 +320,7 @@ namespace dashorch_test
                 .Times(1);
         }
 
-        SetDashTable(APP_DASH_APPLIANCE_TABLE_NAME, appliance1, appliance, true, false);
+        SetDashTable(APP_DASH_APPLIANCE_TABLE_NAME, appliance1, appliance, true, true);
     }
 
     TEST_F(DashOrchTest, CreateRemoveApplianceTrustedVniRemoveFail)
@@ -341,7 +341,7 @@ namespace dashorch_test
         }
 
         SetDashTable(APP_DASH_APPLIANCE_TABLE_NAME, appliance1, appliance);
-        SetDashTable(APP_DASH_APPLIANCE_TABLE_NAME, appliance1, dash::appliance::Appliance(), false, false);
+        SetDashTable(APP_DASH_APPLIANCE_TABLE_NAME, appliance1, dash::appliance::Appliance(), false, true);
     }
 
     TEST_F(DashOrchTest, CreateRemoveApplianceTrustedVnisMixed)
@@ -521,7 +521,7 @@ namespace dashorch_test
                 .Times(1);
         }
 
-        SetDashTable(APP_DASH_ENI_TABLE_NAME, eni1, eni, true, false);
+        SetDashTable(APP_DASH_ENI_TABLE_NAME, eni1, eni, true, true);
     }
 
     TEST_F(DashOrchTest, CreateRemoveEniTrustedVniRemoveFail)
@@ -546,7 +546,7 @@ namespace dashorch_test
         }
 
         SetDashTable(APP_DASH_ENI_TABLE_NAME, eni1, eni);
-        SetDashTable(APP_DASH_ENI_TABLE_NAME, eni1, dash::eni::Eni(), false, false);
+        SetDashTable(APP_DASH_ENI_TABLE_NAME, eni1, dash::eni::Eni(), false, true);
     }
 
     TEST_F(DashOrchTest, CreateRemoveEniTrustedVnisMixed)
