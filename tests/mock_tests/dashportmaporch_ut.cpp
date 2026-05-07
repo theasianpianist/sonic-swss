@@ -207,4 +207,28 @@ namespace dashportmaporch_test
 
         SetDashTable(APP_DASH_OUTBOUND_PORT_MAP_TABLE_NAME, port_map1, dash::outbound_port_map::OutboundPortMap(), false, true);
     }
+
+    TEST_F(DashPortMapOrchTest, PortMapSaiCreateFailureNotRetried)
+    {
+        dash::outbound_port_map::OutboundPortMap port_map;
+        std::vector<sai_object_id_t> exp_oids = {SAI_NULL_OBJECT_ID};
+        std::vector<sai_status_t> exp_status = {SAI_STATUS_INSUFFICIENT_RESOURCES};
+        EXPECT_CALL(*mock_sai_dash_outbound_port_map_api, create_outbound_port_maps)
+            .WillOnce(DoAll(SetArgPointee<5>(SAI_NULL_OBJECT_ID), SetArrayArgument<6>(exp_status.begin(), exp_status.end()), Return(SAI_STATUS_SUCCESS)));
+        SetDashTable(APP_DASH_OUTBOUND_PORT_MAP_TABLE_NAME, port_map1, port_map, true, true);
+    }
+
+    TEST_F(DashPortMapOrchTest, PortMapSaiRemoveFailureNotRetried)
+    {
+        dash::outbound_port_map::OutboundPortMap port_map;
+        // First create a port map
+        EXPECT_CALL(*mock_sai_dash_outbound_port_map_api, create_outbound_port_maps);
+        SetDashTable(APP_DASH_OUTBOUND_PORT_MAP_TABLE_NAME, port_map1, port_map);
+
+        // Then try to remove with SAI failure
+        std::vector<sai_status_t> exp_status = {SAI_STATUS_INVALID_PARAMETER};
+        EXPECT_CALL(*mock_sai_dash_outbound_port_map_api, remove_outbound_port_maps)
+            .WillOnce(DoAll(SetArrayArgument<3>(exp_status.begin(), exp_status.end()), Return(SAI_STATUS_SUCCESS)));
+        SetDashTable(APP_DASH_OUTBOUND_PORT_MAP_TABLE_NAME, port_map1, port_map, false, true);
+    }
 }

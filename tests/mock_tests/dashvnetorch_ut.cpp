@@ -170,4 +170,61 @@ namespace dashvnetorch_test
         int actualUsed = GetCrmUsedCount(CrmResourceType::CRM_DASH_IPV4_PA_VALIDATION);
         EXPECT_EQ(expectedUsed, actualUsed);
     }
+
+    TEST_F(DashVnetOrchTest, VnetSaiCreateFailureNotRetried)
+    {
+        std::vector<sai_object_id_t> exp_oids = {SAI_NULL_OBJECT_ID};
+        EXPECT_CALL(*mock_sai_dash_vnet_api, create_vnets)
+            .WillOnce(DoAll(SetArrayArgument<5>(exp_oids.begin(), exp_oids.end()), Return(SAI_STATUS_INSUFFICIENT_RESOURCES)));
+        CreateVnet();
+    }
+
+    TEST_F(DashVnetOrchTest, VnetMapSaiCreateInvalidParameterNotRetried)
+    {
+        AddVnetEncapRoutingType(dash::route_type::ENCAP_TYPE_VXLAN);
+        CreateVnet();
+        std::vector<sai_status_t> exp_status = {SAI_STATUS_INVALID_PARAMETER};
+        EXPECT_CALL(*mock_sai_dash_outbound_ca_to_pa_api, create_outbound_ca_to_pa_entries)
+            .WillOnce(DoAll(SetArrayArgument<5>(exp_status.begin(), exp_status.end()), Return(SAI_STATUS_SUCCESS)));
+        AddVnetMap(true);
+    }
+
+    class DashVnetOrchNoApplianceTest : public MockDashOrchTest
+    {
+    protected:
+        int GetCrmUsedCount(CrmResourceType type)
+        {
+            CrmOrch::CrmResourceEntry entry = CrmOrch::CrmResourceEntry("", CrmThresholdType::CRM_PERCENTAGE, 0, 1);
+            gCrmOrch->getResAvailability(type, entry);
+            return entry.countersMap["STATS"].usedCounter;
+        }
+
+        void ApplySaiMock() override
+        {
+            INIT_SAI_API_MOCK(dash_vnet);
+            INIT_SAI_API_MOCK(dash_outbound_ca_to_pa);
+            INIT_SAI_API_MOCK(dash_pa_validation);
+            MockSaiApis();
+        }
+
+        void PostSetUp() override
+        {
+            // Do NOT create appliance — tests need to verify behavior without it
+        }
+        void PreTearDown() override
+        {
+            RestoreSaiApis();
+            DEINIT_SAI_API_MOCK(dash_outbound_ca_to_pa);
+            DEINIT_SAI_API_MOCK(dash_pa_validation);
+            DEINIT_SAI_API_MOCK(dash_vnet);
+        }
+    };
+
+    TEST_F(DashVnetOrchNoApplianceTest, CreateVnetMissingApplianceNotRetried)
+    {
+        EXPECT_CALL(*mock_sai_dash_vnet_api, create_vnets).Times(0);
+        dash::vnet::Vnet vnet = dash::vnet::Vnet();
+        vnet.set_vni(5555);
+        SetDashTable(APP_DASH_VNET_TABLE_NAME, "VNET_1", vnet, true, true);
+    }
 }

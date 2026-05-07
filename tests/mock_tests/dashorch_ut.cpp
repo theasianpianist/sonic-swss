@@ -776,4 +776,52 @@ namespace dashorch_test
         SetDashTable(APP_DASH_ENI_TABLE_NAME, eni1, BuildEniEntry());
         VerifyNoAttribute(actual_attrs, SAI_ENI_ATTR_IS_HA_FLOW_OWNER);
     }
+
+    TEST_F(DashOrchTest, CreateEniMissingVnetNotRetried)
+    {
+        CreateApplianceEntry();
+        // Build ENI referencing a VNET that doesn't exist
+        dash::eni::Eni eni = BuildEniEntry();
+        eni.set_vnet("NON_EXISTENT_VNET");
+        EXPECT_CALL(*mock_sai_dash_eni_api, create_eni).Times(0);
+        SetDashTable(APP_DASH_ENI_TABLE_NAME, eni1, eni, true, true);
+    }
+
+    TEST_F(DashOrchTest, CreateEniMissingApplianceNotRetried)
+    {
+        // Do NOT create appliance — ENI requires appliance to exist
+        CreateVnet();
+        EXPECT_CALL(*mock_sai_dash_eni_api, create_eni).Times(0);
+        SetDashTable(APP_DASH_ENI_TABLE_NAME, eni1, BuildEniEntry(), true, true);
+    }
+
+    TEST_F(DashOrchTest, CreateEniSaiFailureNotRetried)
+    {
+        CreateApplianceEntry();
+        CreateVnet();
+        EXPECT_CALL(*mock_sai_dash_eni_api, create_eni)
+            .WillOnce(Return(SAI_STATUS_INSUFFICIENT_RESOURCES));
+        SetDashTable(APP_DASH_ENI_TABLE_NAME, eni1, BuildEniEntry(), true, true);
+    }
+
+    TEST_F(DashOrchTest, EniRouteMissingEniNotRetried)
+    {
+        CreateApplianceEntry();
+        // Do NOT create ENI — ENI route references eni1 which doesn't exist
+        dash::eni_route::EniRoute eni_route;
+        eni_route.set_group_id(route_group1);
+        SetDashTable(APP_DASH_ENI_ROUTE_TABLE_NAME, eni1, eni_route, true, true);
+    }
+
+    TEST_F(DashOrchTest, EniRouteMissingRouteGroupNotRetried)
+    {
+        CreateApplianceEntry();
+        CreateVnet();
+        auto eni = BuildEniEntry();
+        SetDashTable(APP_DASH_ENI_TABLE_NAME, eni1, eni);
+        // Do NOT create route group — ENI route references route_group1 which doesn't exist
+        dash::eni_route::EniRoute eni_route;
+        eni_route.set_group_id(route_group1);
+        SetDashTable(APP_DASH_ENI_ROUTE_TABLE_NAME, eni1, eni_route, true, true);
+    }
 }

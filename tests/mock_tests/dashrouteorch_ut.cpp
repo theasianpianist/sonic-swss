@@ -186,4 +186,55 @@ namespace dashrouteorch_test
         RemoveInboundRoutingEntry();
         EXPECT_EQ(GetCrmUsedCount(CrmResourceType::CRM_DASH_IPV4_INBOUND_ROUTING), baselineUsed);
     }
+
+    TEST_F(DashRouteOrchTest, OutboundRouteMissingVnetNotRetried)
+    {
+        // Route references VNET but VNET doesn't exist (PostSetUp creates it, so we need a route referencing a different VNET)
+        dash::route::Route route = dash::route::Route();
+        route.set_routing_type(dash::route_type::ROUTING_TYPE_VNET);
+        route.set_vnet("NON_EXISTENT_VNET");
+        EXPECT_CALL(*mock_sai_dash_outbound_routing_api, create_outbound_routing_entries).Times(0);
+        AddOutboundRoutingGroup();
+        SetDashTable(APP_DASH_ROUTE_TABLE_NAME, route_group1 + ":1.2.3.4/32", route, true, true);
+    }
+
+    TEST_F(DashRouteOrchTest, OutboundRouteSaiInvalidParameterNotRetried)
+    {
+        AddOutboundRoutingGroup();
+        AddTunnel();
+        std::vector<sai_status_t> exp_status = {SAI_STATUS_INVALID_PARAMETER};
+        EXPECT_CALL(*mock_sai_dash_outbound_routing_api, create_outbound_routing_entries)
+            .WillOnce(DoAll(SetArrayArgument<5>(exp_status.begin(), exp_status.end()), Return(SAI_STATUS_SUCCESS)));
+        AddOutboundRoutingEntry(true);
+    }
+
+    TEST_F(DashRouteOrchTest, OutboundRouteSaiInsufficientResourcesNotRetried)
+    {
+        AddOutboundRoutingGroup();
+        AddTunnel();
+        std::vector<sai_status_t> exp_status = {SAI_STATUS_INSUFFICIENT_RESOURCES};
+        EXPECT_CALL(*mock_sai_dash_outbound_routing_api, create_outbound_routing_entries)
+            .WillOnce(DoAll(SetArrayArgument<5>(exp_status.begin(), exp_status.end()), Return(SAI_STATUS_SUCCESS)));
+        AddOutboundRoutingEntry(true);
+    }
+
+    TEST_F(DashRouteOrchTest, InboundRouteMissingEniNotRetried)
+    {
+        // Inbound route references an ENI that doesn't exist
+        dash::route_rule::RouteRule rule = dash::route_rule::RouteRule();
+        rule.set_pa_validation(true);
+        EXPECT_CALL(*mock_sai_dash_inbound_routing_api, create_inbound_routing_entries).Times(0);
+        SetDashTable(APP_DASH_ROUTE_RULE_TABLE_NAME, "NON_EXISTENT_ENI:5555:10.0.0.0/24", rule, true, true);
+    }
+
+    TEST_F(DashRouteOrchTest, RouteGroupSaiRemoveInUseNotRetried)
+    {
+        AddOutboundRoutingGroup();
+        // Route group remove with bound routes should not retry.
+        // Bind a route to the group, then try to remove the group
+        AddTunnel();
+        AddOutboundRoutingEntry();
+        // Removing the route group while routes are bound should consume the notification
+        SetDashTable(APP_DASH_ROUTE_GROUP_TABLE_NAME, route_group1, dash::route_group::RouteGroup(), false, true);
+    }
 }
