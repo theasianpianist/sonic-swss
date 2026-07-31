@@ -58,6 +58,7 @@ tests_SOURCES = aclorch_ut.cpp \
                 portmgr_ut.cpp \
                 sflowmgrd_ut.cpp \
                 policerorch_ut.cpp \
+                vnetorch_ut.cpp \
                 fake_response_publisher.cpp \
                 swssnet_ut.cpp \
                 flowcounterrouteorch_ut.cpp \
