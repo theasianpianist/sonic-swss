@@ -143,6 +143,11 @@ namespace vnetorch_test
             sai_ip_address_t src{};
             vector<sai_object_id_t> decap_mappers;
             vector<sai_object_id_t> encap_mappers;
+            // IPINIP subnet-decap tunnels carry decap DSCP/ECN/TTL modes; -1
+            // means the attribute was not present at create time.
+            int32_t dscp_mode = -1;
+            int32_t ecn_mode = -1;
+            int32_t ttl_mode = -1;
         };
         struct Term
         {
@@ -152,6 +157,11 @@ namespace vnetorch_test
             sai_object_id_t vr = SAI_NULL_OBJECT_ID;
             sai_object_id_t action_tunnel = SAI_NULL_OBJECT_ID;
             sai_ip_address_t dst{};
+            // MP2MP subnet-decap terms additionally set the dst mask and the
+            // src network + mask; P2P/P2MP terms leave these default.
+            sai_ip_address_t dst_mask{};
+            sai_ip_address_t src{};
+            sai_ip_address_t src_mask{};
         };
         struct MapEntry
         {
@@ -461,6 +471,11 @@ namespace vnetorch_test
         BfdCaptures m_bfd;
         set<string> m_deliveredBfdKeys;
 
+        // APP_TUNNEL_DECAP_TERM_TABLE keys already delivered to gTunneldecapOrch,
+        // so syncTunnelDecapTerm() can diff VNetRouteOrch's subnet-decap-term
+        // producer writes the same way syncBfd() diffs BFD sessions.
+        set<string> m_deliveredDecapTermKeys;
+
         void SetUp() override
         {
             // gDB (the mock DB backing swss::Table) is process-global and is not
@@ -669,6 +684,9 @@ namespace vnetorch_test
                             t.decap_mappers.assign(a->value.objlist.list, a->value.objlist.list + a->value.objlist.count);
                         if (auto a = findRawAttr(l, n, SAI_TUNNEL_ATTR_ENCAP_MAPPERS))
                             t.encap_mappers.assign(a->value.objlist.list, a->value.objlist.list + a->value.objlist.count);
+                        if (auto a = findRawAttr(l, n, SAI_TUNNEL_ATTR_DECAP_DSCP_MODE)) t.dscp_mode = a->value.s32;
+                        if (auto a = findRawAttr(l, n, SAI_TUNNEL_ATTR_DECAP_ECN_MODE)) t.ecn_mode = a->value.s32;
+                        if (auto a = findRawAttr(l, n, SAI_TUNNEL_ATTR_DECAP_TTL_MODE)) t.ttl_mode = a->value.s32;
                         m_tun.tunnels.push_back(t);
                     }
                     return st;
@@ -718,6 +736,9 @@ namespace vnetorch_test
                         if (auto a = findRawAttr(l, n, SAI_TUNNEL_TERM_TABLE_ENTRY_ATTR_VR_ID)) t.vr = a->value.oid;
                         if (auto a = findRawAttr(l, n, SAI_TUNNEL_TERM_TABLE_ENTRY_ATTR_ACTION_TUNNEL_ID)) t.action_tunnel = a->value.oid;
                         if (auto a = findRawAttr(l, n, SAI_TUNNEL_TERM_TABLE_ENTRY_ATTR_DST_IP)) t.dst = a->value.ipaddr;
+                        if (auto a = findRawAttr(l, n, SAI_TUNNEL_TERM_TABLE_ENTRY_ATTR_DST_IP_MASK)) t.dst_mask = a->value.ipaddr;
+                        if (auto a = findRawAttr(l, n, SAI_TUNNEL_TERM_TABLE_ENTRY_ATTR_SRC_IP)) t.src = a->value.ipaddr;
+                        if (auto a = findRawAttr(l, n, SAI_TUNNEL_TERM_TABLE_ENTRY_ATTR_SRC_IP_MASK)) t.src_mask = a->value.ipaddr;
                         m_tun.terms.push_back(t);
                     }
                     return st;
@@ -986,6 +1007,7 @@ namespace vnetorch_test
             m_vnetRouteOrch->addExistingData(&tbl);
             static_cast<Orch *>(m_vnetRouteOrch.get())->doTask();
             syncBfd();
+            syncTunnelDecapTerm();
         }
 
         // Delete a monitored route, then flush the BFD session removals its
@@ -994,6 +1016,7 @@ namespace vnetorch_test
         {
             delVnetRoute(vnet, prefix);
             syncBfd();
+            syncTunnelDecapTerm();
         }
 
         // A priority (primary/secondary) custom-monitored VNET route. The VS
@@ -1082,6 +1105,187 @@ namespace vnetorch_test
                 gBfdOrch->getExecutor(APP_BFD_SESSION_TABLE_NAME));
             consumer->addToSync(entries);
             static_cast<Orch *>(gBfdOrch)->doTask(*consumer);
+        }
+
+        // Deliver the APP_TUNNEL_DECAP_TERM_TABLE changes VNetRouteOrch's
+        // producer made to gTunneldecapOrch, exactly as syncBfd() does for BFD
+        // sessions. On a route going active VNetRouteOrch::createSubnetDecapTerm
+        // writes a TUNNEL_DECAP_TERM_TABLE row (<tunnel>:<prefix>) and on the
+        // route going inactive removeSubnetDecapTerm .del()s it; we diff against
+        // what we delivered so new keys flow as SET (gTunneldecapOrch creates the
+        // MP2MP SAI term) and disappeared keys as DEL (it removes it). When
+        // subnet decap is disabled createSubnetDecapTerm is a no-op, so the term
+        // table stays empty and this is a harmless no-op for non-decap tests.
+        void syncTunnelDecapTerm()
+        {
+            Table tbl(m_app_db.get(), APP_TUNNEL_DECAP_TERM_TABLE_NAME);
+            vector<string> keyList;
+            tbl.getKeys(keyList);
+            set<string> current(keyList.begin(), keyList.end());
+
+            deque<KeyOpFieldsValuesTuple> entries;
+            for (const auto &k : current)
+            {
+                if (m_deliveredDecapTermKeys.count(k)) continue;
+                vector<FieldValueTuple> fvs;
+                tbl.get(k, fvs);
+                entries.push_back({k, SET_COMMAND, fvs});
+            }
+            for (const auto &k : m_deliveredDecapTermKeys)
+            {
+                if (!current.count(k)) entries.push_back({k, DEL_COMMAND, {}});
+            }
+            m_deliveredDecapTermKeys = current;
+
+            if (entries.empty()) return;
+            auto consumer = dynamic_cast<Consumer *>(
+                gTunneldecapOrch->getExecutor(APP_TUNNEL_DECAP_TERM_TABLE_NAME));
+            consumer->addToSync(entries);
+            static_cast<Orch *>(gTunneldecapOrch)->doTask(*consumer);
+        }
+
+        // Apply the SUBNET_DECAP feature config, the mock equivalent of the
+        // setup_subnet_decap fixture (CONFIG_DB SUBNET_DECAP|AZURE). TunnelDecapOrch
+        // stores src_ip / src_ip_v6 in its SubnetDecapConfig, which
+        // VNetRouteOrch::createSubnetDecapTerm later uses as the term's source
+        // subnet. Driven through gTunneldecapOrch's CFG_SUBNET_DECAP consumer.
+        void setSubnetDecapConfig(const string &status, const string &src_ip,
+                                  const string &src_ip_v6)
+        {
+            Table tbl(m_config_db.get(), CFG_SUBNET_DECAP_TABLE_NAME);
+            vector<FieldValueTuple> fvs = {{"status", status},
+                                           {"src_ip", src_ip},
+                                           {"src_ip_v6", src_ip_v6}};
+            tbl.set("AZURE", fvs);
+            gTunneldecapOrch->addExistingData(&tbl);
+            static_cast<Orch *>(gTunneldecapOrch)->doTask();
+        }
+
+        // Create the IPINIP subnet-decap tunnel, the mock equivalent of
+        // vnet_lib.create_subnet_decap_tunnel (APP_DB TUNNEL_DECAP_TABLE).
+        // Orchagent creates a SAI IPINIP tunnel with the given decap DSCP/ECN/TTL
+        // modes; the mock captures it via the tunnel API trampolines.
+        void createSubnetDecapTunnel(const string &name, const string &dscp_mode,
+                                     const string &ecn_mode, const string &ttl_mode)
+        {
+            Table tbl(m_app_db.get(), APP_TUNNEL_DECAP_TABLE_NAME);
+            vector<FieldValueTuple> fvs = {{"tunnel_type", "IPINIP"},
+                                           {"dscp_mode", dscp_mode},
+                                           {"ecn_mode", ecn_mode},
+                                           {"ttl_mode", ttl_mode}};
+            tbl.set(name, fvs);
+            gTunneldecapOrch->addExistingData(&tbl);
+            static_cast<Orch *>(gTunneldecapOrch)->doTask();
+        }
+
+        // Delete the IPINIP subnet-decap tunnel (DEL via consumer push so the
+        // remove handler actually runs). Mock equivalent of
+        // vnet_lib.delete_subnet_decap_tunnel.
+        void delSubnetDecapTunnel(const string &name)
+        {
+            Table tbl(m_app_db.get(), APP_TUNNEL_DECAP_TABLE_NAME);
+            tbl.del(name);
+            auto consumer = dynamic_cast<Consumer *>(
+                gTunneldecapOrch->getExecutor(APP_TUNNEL_DECAP_TABLE_NAME));
+            consumer->addToSync({{name, DEL_COMMAND, {}}});
+            static_cast<Orch *>(gTunneldecapOrch)->doTask(*consumer);
+        }
+
+        // Find the IPINIP subnet-decap tunnel among the captured tunnels (a VXLAN
+        // tunnel coexists) and assert its decap DSCP/ECN/TTL modes -- the mock
+        // equivalent of vnet_lib.check_ipinip_tunnel. Returns the tunnel oid so
+        // the decap-term check can assert ACTION_TUNNEL_ID points at it. Note the
+        // VS check inspects the ENCAP_* mode attrs (a libsaivs quirk), whereas
+        // orchagent actually programs the DECAP_* attrs (tunneldecaporch.cpp), so
+        // the mock verifies those -- same intent, faithful to what is programmed.
+        sai_object_id_t checkIpinipTunnel(int32_t dscp_mode, int32_t ecn_mode,
+                                          int32_t ttl_mode)
+        {
+            const TunnelCaptures::Tunnel *found = nullptr;
+            for (const auto &t : m_tun.tunnels)
+            {
+                if (t.type == SAI_TUNNEL_TYPE_IPINIP) { found = &t; break; }
+            }
+            EXPECT_NE(found, nullptr) << "no IPINIP tunnel captured";
+            if (!found) return SAI_NULL_OBJECT_ID;
+            EXPECT_EQ(found->dscp_mode, dscp_mode);
+            EXPECT_EQ(found->ecn_mode, ecn_mode);
+            EXPECT_EQ(found->ttl_mode, ttl_mode);
+            return found->oid;
+        }
+
+        // Locate the currently-active MP2MP IPINIP subnet-decap term for a route
+        // prefix + source subnet ("active" = created and not since removed),
+        // mirroring the (tunnel, src, dst) keying of
+        // vnet_lib.check_ipinip_tunnel_decap_term.
+        const TunnelCaptures::Term *findIpinipDecapTerm(const string &dstPrefix,
+                                                        const string &srcSubnet)
+        {
+            swss::IpPrefix dp(dstPrefix), sp(srcSubnet);
+            for (const auto &t : m_tun.terms)
+            {
+                if (t.type != SAI_TUNNEL_TERM_TABLE_ENTRY_TYPE_MP2MP) continue;
+                if (t.tunnel_type != SAI_TUNNEL_TYPE_IPINIP) continue;
+                if (std::find(m_tun.removedTerms.begin(), m_tun.removedTerms.end(),
+                              t.oid) != m_tun.removedTerms.end())
+                    continue;
+                if (ipAddrEquals(t.dst, dp.getIp().to_string()) &&
+                    ipAddrEquals(t.src, sp.getIp().to_string()))
+                    return &t;
+            }
+            return nullptr;
+        }
+
+        // Assert an active MP2MP IPINIP decap term exists with the right VR,
+        // action tunnel, and src/dst network+mask -- the mock equivalent of
+        // vnet_lib.check_ipinip_tunnel_decap_term.
+        void checkIpinipDecapTerm(const string &dstPrefix, const string &srcSubnet,
+                                  sai_object_id_t tunnelOid)
+        {
+            swss::IpPrefix dp(dstPrefix), sp(srcSubnet);
+            const auto *term = findIpinipDecapTerm(dstPrefix, srcSubnet);
+            ASSERT_NE(term, nullptr)
+                << "no MP2MP IPINIP decap term for dst " << dstPrefix
+                << " src " << srcSubnet;
+            EXPECT_EQ(term->vr, gVirtualRouterId);
+            EXPECT_EQ(term->action_tunnel, tunnelOid);
+            EXPECT_TRUE(ipAddrEquals(term->dst, dp.getIp().to_string()));
+            EXPECT_TRUE(ipAddrEquals(term->dst_mask, dp.getMask().to_string()));
+            EXPECT_TRUE(ipAddrEquals(term->src, sp.getIp().to_string()));
+            EXPECT_TRUE(ipAddrEquals(term->src_mask, sp.getMask().to_string()));
+        }
+
+        // Assert no active MP2MP IPINIP decap term exists for the prefix (the
+        // term has not been created yet) -- the mock equivalent of the VS
+        // `with pytest.raises(AssertionError): check_ipinip_tunnel_decap_term`.
+        void checkNoIpinipDecapTerm(const string &dstPrefix, const string &srcSubnet)
+        {
+            EXPECT_EQ(findIpinipDecapTerm(dstPrefix, srcSubnet), nullptr)
+                << "unexpected MP2MP IPINIP decap term for dst " << dstPrefix;
+        }
+
+        // Assert the previously-created MP2MP IPINIP decap term for the prefix
+        // has been removed -- the mock equivalent of
+        // vnet_lib.check_del_ipinip_tunnel_decap_term (asserts a matching term
+        // was created and then removed, and none is currently active).
+        void checkIpinipDecapTermRemoved(const string &dstPrefix,
+                                         const string &srcSubnet)
+        {
+            swss::IpPrefix dp(dstPrefix), sp(srcSubnet);
+            EXPECT_EQ(findIpinipDecapTerm(dstPrefix, srcSubnet), nullptr)
+                << "MP2MP IPINIP decap term for " << dstPrefix << " should be gone";
+            bool removed = false;
+            for (const auto &t : m_tun.terms)
+            {
+                if (t.type != SAI_TUNNEL_TERM_TABLE_ENTRY_TYPE_MP2MP) continue;
+                if (!ipAddrEquals(t.dst, dp.getIp().to_string())) continue;
+                if (!ipAddrEquals(t.src, sp.getIp().to_string())) continue;
+                if (std::find(m_tun.removedTerms.begin(), m_tun.removedTerms.end(),
+                              t.oid) != m_tun.removedTerms.end())
+                    removed = true;
+            }
+            EXPECT_TRUE(removed) << "decap term for " << dstPrefix
+                                 << " was never created/removed";
         }
 
         // Program a directly-connected (local) endpoint. Creates an L3 router
@@ -1206,6 +1410,11 @@ namespace vnetorch_test
             Table bfdStateTbl(m_state_db.get(), STATE_BFD_SESSION_TABLE_NAME);
             m_bfdMonitorOrch->addExistingData(&bfdStateTbl);
             static_cast<Orch *>(m_bfdMonitorOrch.get())->doTask();
+
+            // A BFD state change activates/deactivates the route, which (when
+            // subnet decap is enabled) creates/removes its MP2MP decap term;
+            // flush those term writes to gTunneldecapOrch. No-op otherwise.
+            syncTunnelDecapTerm();
         }
 
         // Enable/disable Traffic-Shift-Away, the mock equivalent of vnet_lib
@@ -3487,6 +3696,141 @@ namespace vnetorch_test
 
         delVnet("Vnet_local_ep");
         delVxlanTunnel("tunnel_local_ep");
+    }
+
+    // Mock equivalent of test_vnet_orch_26: a BFD-monitored ECMP VNET route on
+    // a subnet-decap-enabled switch. The MP2MP IPINIP decap term is created when
+    // the route first becomes active (first monitor up) and removed when it goes
+    // inactive (all monitors down); the ECMP route + prefix advertisement follow
+    // the usual BFD-state machine.
+    TEST_F(VNetOrchTest, VnetSubnetDecapTermFollowsBfdState)
+    {
+        // Enable subnet decap and create the IPINIP subnet-decap tunnel.
+        setSubnetDecapConfig("enable", "10.10.10.0/24", "20c1:ba8::/64");
+        createSubnetDecapTunnel("IPINIP_SUBNET", "uniform", "standard", "pipe");
+        const sai_object_id_t ipinip = checkIpinipTunnel(
+            SAI_TUNNEL_DSCP_MODE_UNIFORM_MODEL,
+            SAI_TUNNEL_DECAP_ECN_MODE_STANDARD,
+            SAI_TUNNEL_TTL_MODE_PIPE_MODEL);
+        ASSERT_NE(ipinip, SAI_NULL_OBJECT_ID);
+
+        setVxlanTunnel("tunnel_26", "26.26.26.26");
+        setVnet("Vnet26", "tunnel_26", "10026", "", /*advertise_prefix=*/true);
+
+        setVnetRouteMonitored("Vnet26", "100.100.1.1/32",
+                              "26.0.0.1,26.0.0.2,26.0.0.3",
+                              "26.1.0.1,26.1.0.2,26.1.0.3", "test_profile");
+
+        // Default BFD state is down: no decap term, the route is not programmed
+        // and is neither in STATE_DB nor advertised.
+        checkNoIpinipDecapTerm("100.100.1.1/32", "10.10.10.0/24");
+        EXPECT_EQ(findRoute("100.100.1.1"), nullptr);
+        checkStateDbRoute("Vnet26", "100.100.1.1/32", "");
+        checkRouteNotAdvertised("100.100.1.1/32");
+
+        // First monitor up makes the route active -> the decap term is created.
+        updateBfdSessionState("26.1.0.1", SAI_BFD_SESSION_STATE_UP);
+        checkIpinipDecapTerm("100.100.1.1/32", "10.10.10.0/24", ipinip);
+
+        // All monitors up: the ECMP route is programmed over a 3-member group,
+        // STATE_DB lists all three, and the prefix is advertised with its
+        // profile. The decap term stays.
+        updateBfdSessionState("26.1.0.2", SAI_BFD_SESSION_STATE_UP);
+        updateBfdSessionState("26.1.0.3", SAI_BFD_SESSION_STATE_UP);
+        const RouteCaptures::Route *r = findRoute("100.100.1.1");
+        ASSERT_NE(r, nullptr);
+        EXPECT_EQ(activeMembers(r->next_hop_id), 3U);
+        checkStateDbRoute("Vnet26", "100.100.1.1/32", "26.0.0.1,26.0.0.2,26.0.0.3");
+        checkRouteAdvertised("100.100.1.1/32", "test_profile");
+        checkIpinipDecapTerm("100.100.1.1/32", "10.10.10.0/24", ipinip);
+
+        // All monitors down: the route is withdrawn, STATE_DB inactive, prefix
+        // unadvertised, and the decap term is removed.
+        updateBfdSessionState("26.1.0.1", SAI_BFD_SESSION_STATE_DOWN);
+        updateBfdSessionState("26.1.0.2", SAI_BFD_SESSION_STATE_DOWN);
+        updateBfdSessionState("26.1.0.3", SAI_BFD_SESSION_STATE_DOWN);
+        checkIpinipDecapTermRemoved("100.100.1.1/32", "10.10.10.0/24");
+        checkStateDbRoute("Vnet26", "100.100.1.1/32", "");
+        checkRouteNotAdvertised("100.100.1.1/32");
+
+        // Delete the route: its STATE_DB entry and BFD sessions are removed.
+        delVnetRouteMonitored("Vnet26", "100.100.1.1/32");
+        checkStateDbRouteRemoved("Vnet26", "100.100.1.1/32");
+        for (const char *mon : {"26.1.0.1", "26.1.0.2", "26.1.0.3"})
+            EXPECT_FALSE(bfdSessionExists(mon)) << "BFD session " << mon << " not removed";
+
+        delVnet("Vnet26");
+        delVxlanTunnel("tunnel_26");
+
+        // Removing the subnet-decap tunnel tears down the IPINIP SAI tunnel.
+        delSubnetDecapTunnel("IPINIP_SUBNET");
+        EXPECT_NE(find(m_tun.removedTunnels.begin(), m_tun.removedTunnels.end(), ipinip),
+                  m_tun.removedTunnels.end())
+            << "IPINIP tunnel not removed";
+    }
+
+    // Mock equivalent of test_vnet_orch_27: the IPv6 counterpart of test 26 --
+    // a BFD-monitored IPv6 ECMP VNET route whose MP2MP IPINIP decap term (source
+    // subnet from src_ip_v6) follows the route's active/inactive state.
+    TEST_F(VNetOrchTest, VnetSubnetDecapTermFollowsBfdStateIpv6)
+    {
+        setSubnetDecapConfig("enable", "10.10.10.0/24", "20c1:ba8::/64");
+        createSubnetDecapTunnel("IPINIP_SUBNET_V6", "uniform", "standard", "pipe");
+        const sai_object_id_t ipinip = checkIpinipTunnel(
+            SAI_TUNNEL_DSCP_MODE_UNIFORM_MODEL,
+            SAI_TUNNEL_DECAP_ECN_MODE_STANDARD,
+            SAI_TUNNEL_TTL_MODE_PIPE_MODEL);
+        ASSERT_NE(ipinip, SAI_NULL_OBJECT_ID);
+
+        // The VS test reuses the name 'Vnet26' for this IPv6 case.
+        setVxlanTunnel("tunnel_27", "fd:10::32");
+        setVnet("Vnet26", "tunnel_27", "10010", "", /*advertise_prefix=*/true);
+
+        setVnetRouteMonitored("Vnet26", "fd:10:10::1/128",
+                              "fd:10:1::1,fd:10:1::2,fd:10:1::3",
+                              "fd:10:2::1,fd:10:2::2,fd:10:2::3", "test_profile");
+
+        // Default BFD state is down: no decap term, route not programmed.
+        checkNoIpinipDecapTerm("fd:10:10::1/128", "20c1:ba8::/64");
+        EXPECT_EQ(findRoute("fd:10:10::1"), nullptr);
+        checkStateDbRoute("Vnet26", "fd:10:10::1/128", "");
+        checkRouteNotAdvertised("fd:10:10::1/128");
+
+        // First monitor up -> the IPv6 decap term is created (src from src_ip_v6).
+        updateBfdSessionState("fd:10:2::2", SAI_BFD_SESSION_STATE_UP);
+        checkIpinipDecapTerm("fd:10:10::1/128", "20c1:ba8::/64", ipinip);
+
+        // All up: ECMP route programmed, advertised with profile, term stays.
+        updateBfdSessionState("fd:10:2::3", SAI_BFD_SESSION_STATE_UP);
+        updateBfdSessionState("fd:10:2::1", SAI_BFD_SESSION_STATE_UP);
+        const RouteCaptures::Route *r = findRoute("fd:10:10::1");
+        ASSERT_NE(r, nullptr);
+        EXPECT_EQ(activeMembers(r->next_hop_id), 3U);
+        checkStateDbRoute("Vnet26", "fd:10:10::1/128",
+                          "fd:10:1::1,fd:10:1::2,fd:10:1::3");
+        checkRouteAdvertised("fd:10:10::1/128", "test_profile");
+        checkIpinipDecapTerm("fd:10:10::1/128", "20c1:ba8::/64", ipinip);
+
+        // All down: route withdrawn, term removed.
+        updateBfdSessionState("fd:10:2::1", SAI_BFD_SESSION_STATE_DOWN);
+        updateBfdSessionState("fd:10:2::2", SAI_BFD_SESSION_STATE_DOWN);
+        updateBfdSessionState("fd:10:2::3", SAI_BFD_SESSION_STATE_DOWN);
+        checkIpinipDecapTermRemoved("fd:10:10::1/128", "20c1:ba8::/64");
+        checkStateDbRoute("Vnet26", "fd:10:10::1/128", "");
+        checkRouteNotAdvertised("fd:10:10::1/128");
+
+        delVnetRouteMonitored("Vnet26", "fd:10:10::1/128");
+        checkStateDbRouteRemoved("Vnet26", "fd:10:10::1/128");
+        for (const char *mon : {"fd:10:2::1", "fd:10:2::2", "fd:10:2::3"})
+            EXPECT_FALSE(bfdSessionExists(mon)) << "BFD session " << mon << " not removed";
+
+        delVnet("Vnet26");
+        delVxlanTunnel("tunnel_27");
+
+        delSubnetDecapTunnel("IPINIP_SUBNET_V6");
+        EXPECT_NE(find(m_tun.removedTunnels.begin(), m_tun.removedTunnels.end(), ipinip),
+                  m_tun.removedTunnels.end())
+            << "IPINIP tunnel not removed";
     }
 
     // Mock equivalent of test_vnet_orch_32: a custom_bfd priority route with two
