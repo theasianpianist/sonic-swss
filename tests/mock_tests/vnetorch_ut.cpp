@@ -733,11 +733,12 @@ namespace vnetorch_test
         // ECMP next hop group.
         void setVnetRoute(const string &vnet, const string &prefix,
                           const string &endpoints, const string &mac = "",
-                          const string &vni = "")
+                          const string &vni = "", const string &metric = "")
         {
             vector<FieldValueTuple> fvs = {{"endpoint", endpoints}};
             if (!mac.empty()) fvs.push_back({"mac_address", mac});
             if (!vni.empty()) fvs.push_back({"vni", vni});
+            if (!metric.empty()) fvs.push_back({"metric", metric});
             Table tbl(m_app_db.get(), APP_VNET_RT_TUNNEL_TABLE_NAME);
             tbl.set(vnet + ":" + prefix, fvs);
             m_vnetRouteOrch->addExistingData(&tbl);
@@ -2590,5 +2591,50 @@ namespace vnetorch_test
         checkStateDbRouteRemoved("Vnet22", "100.100.1.11/32");
         for (const char *m : {"19.1.0.1", "19.1.0.2", "19.1.0.3"})
             checkCustomMonitorDeleted("100.100.1.11/32", m);
+    }
+
+    // VNET tunnel routes carrying a metric field -- the mock equivalent of
+    // test_vnet_orch_33. metric is a passthrough field (VNetCfgRouteOrch mirrors
+    // it verbatim into APP_DB and orchagent's VNetRouteOrch does not act on it),
+    // so this asserts that a full range of metric values does not disturb route
+    // programming: each single-endpoint route still programs a tunnel next hop
+    // and an active STATE_DB entry, and the metric round-trips into APP_DB.
+    TEST_F(VNetOrchTest, VnetTunnelRouteMetricValues)
+    {
+        setVxlanTunnel("tunnel_33", "10.10.10.10");
+        setVnet("Vnet33", "tunnel_33", "10033", "");
+
+        for (int i = 0; i <= 20; i++)
+        {
+            const string prefix = "0.0.0." + to_string(i) + "/32";
+            const string endpoint = "10.10.10." + to_string(i);
+            const string metric = to_string(i);
+
+            setVnetRoute("Vnet33", prefix, endpoint, "", "", metric);
+
+            // The route programs a tunnel encap next hop to the endpoint.
+            const RouteCaptures::Route *r = findRoute("0.0.0." + to_string(i));
+            ASSERT_NE(r, nullptr) << "route " << prefix << " not programmed";
+            const RouteCaptures::NextHop *nh = nullptr;
+            for (const auto &cand : m_rt.nexthops)
+                if (cand.oid == r->next_hop_id) nh = &cand;
+            ASSERT_NE(nh, nullptr);
+            EXPECT_EQ(nh->type, SAI_NEXT_HOP_TYPE_TUNNEL_ENCAP);
+            EXPECT_TRUE(ipAddrEquals(nh->ip, endpoint));
+            checkStateDbRoute("Vnet33", prefix, endpoint);
+
+            // The metric field survives into APP_DB (what VNetRouteOrch consumes).
+            Table rtTbl(m_app_db.get(), APP_VNET_RT_TUNNEL_TABLE_NAME);
+            vector<FieldValueTuple> fvs;
+            ASSERT_TRUE(rtTbl.get("Vnet33:" + prefix, fvs));
+            string readMetric;
+            for (const auto &fv : fvs)
+                if (fvField(fv) == "metric") readMetric = fvValue(fv);
+            EXPECT_EQ(readMetric, metric);
+
+            delVnetRoute("Vnet33", prefix);
+            EXPECT_EQ(findRoute("0.0.0." + to_string(i)), nullptr);
+            checkStateDbRouteRemoved("Vnet33", prefix);
+        }
     }
 }
