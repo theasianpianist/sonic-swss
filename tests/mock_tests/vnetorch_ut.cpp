@@ -665,6 +665,19 @@ namespace vnetorch_test
             static_cast<Orch *>(m_VxlanTunnelOrch)->doTask();
         }
 
+        // Mirror the VS test's ordered_ecmp fixture: writing SWITCH_TABLE:switch
+        // ordered_ecmp=true drives gSwitchOrch to query the SAI ORDERED_ECMP
+        // capability and, when present, program VNET ECMP groups as
+        // SAI_NEXT_HOP_GROUP_TYPE_DYNAMIC_ORDERED_ECMP with per-member sequence
+        // IDs (vnetorch.cpp:830/869).
+        void enableOrderedEcmp()
+        {
+            Table tbl(m_app_db.get(), APP_SWITCH_TABLE_NAME);
+            tbl.set("switch", {{"ordered_ecmp", "true"}});
+            gSwitchOrch->addExistingData(&tbl);
+            static_cast<Orch *>(gSwitchOrch)->doTask();
+        }
+
         void setVnet(const string &name, const string &tunnel, const string &vni,
                      const string &peer_list, bool advertise_prefix = false)
         {
@@ -858,7 +871,145 @@ namespace vnetorch_test
             return n;
         }
 
-        // Find the captured route for a host prefix (IPv4 or IPv6), skipping the
+        // Assert the active member of nhg for tunnel endpoint ip exists, and
+        // (ordered ECMP) carries the expected SAI_NEXT_HOP_GROUP_MEMBER_ATTR_
+        // SEQUENCE_ID, mirroring vnet_lib.check_next_hop_group_member(). With
+        // unordered ECMP, members carry no sequence id.
+        void checkGroupMember(sai_object_id_t nhg, const string &ip, bool ordered,
+                              uint32_t expected_seq) const
+        {
+            for (const auto &m : m_rt.members)
+            {
+                if (m.nhg != nhg) continue;
+                if (find(m_rt.removedMembers.begin(), m_rt.removedMembers.end(), m.oid) !=
+                    m_rt.removedMembers.end())
+                    continue;
+                for (const auto &nh : m_rt.nexthops)
+                {
+                    if (nh.oid == m.nh && ipAddrEquals(nh.ip, ip))
+                    {
+                        if (ordered)
+                        {
+                            EXPECT_TRUE(m.has_seq) << "member " << ip << " missing sequence id";
+                            EXPECT_EQ(m.seq, expected_seq) << "member " << ip << " wrong sequence id";
+                        }
+                        else
+                        {
+                            EXPECT_FALSE(m.has_seq)
+                                << "member " << ip << " unexpectedly has a sequence id";
+                        }
+                        return;
+                    }
+                }
+            }
+            ADD_FAILURE() << "no active group member for endpoint " << ip;
+        }
+
+        // Scenario body for the mock equivalent of test_vnet_orch_11 (mixed
+        // single-endpoint + ECMP BFD-monitored routes sharing sessions). A
+        // fixture method so it can drive the helpers and read the captures;
+        // called by the ordered and unordered TEST_Fs below.
+        void runMixedMonitoredRoutes(bool ordered)
+        {
+            if (ordered) enableOrderedEcmp();
+
+            setVxlanTunnel("tunnel_11", "11.11.11.11");
+            setVnet("Vnet11", "tunnel_11", "100011", "");
+
+            auto activeNexthops = [&]() {
+                size_t c = 0;
+                for (const auto &nh : m_rt.nexthops)
+                    if (find(m_rt.removedNexthops.begin(), m_rt.removedNexthops.end(),
+                             nh.oid) == m_rt.removedNexthops.end())
+                        c++;
+                return c;
+            };
+
+            // route1: single endpoint 11.0.0.1 / monitor 11.1.0.1. Default BFD
+            // state is down -> not programmed, not advertised.
+            setVnetRouteMonitored("Vnet11", "100.100.1.1/32", "11.0.0.1", "11.1.0.1");
+            EXPECT_EQ(findRoute("100.100.1.1"), nullptr);
+            checkStateDbRoute("Vnet11", "100.100.1.1/32", "");
+            checkRouteNotAdvertised("100.100.1.1/32");
+
+            // Monitor up: route1 programmed as a single tunnel next hop (no
+            // group).
+            updateBfdSessionState("11.1.0.1", SAI_BFD_SESSION_STATE_UP);
+            ASSERT_NE(findRoute("100.100.1.1"), nullptr);
+            EXPECT_TRUE(m_rt.groups.empty());
+            EXPECT_EQ(activeNexthops(), 1U);
+            checkStateDbRoute("Vnet11", "100.100.1.1/32", "11.0.0.1");
+
+            // route2: ECMP over 11.0.0.2/11.0.0.1 with monitors 11.1.0.2/
+            // 11.1.0.1. Only 11.1.0.1 is up so far, so route2 is a one-member
+            // group over 11.0.0.1 (sequence id 1 = 11.0.0.1's position in the
+            // sorted set).
+            setVnetRouteMonitored("Vnet11", "100.100.2.1/32", "11.0.0.2,11.0.0.1",
+                                  "11.1.0.2,11.1.0.1");
+            const RouteCaptures::Route *r2 = findRoute("100.100.2.1");
+            ASSERT_NE(r2, nullptr);
+            const sai_object_id_t nhg2 = r2->next_hop_id;
+            EXPECT_EQ(activeMembers(nhg2), 1U);
+            checkGroupMember(nhg2, "11.0.0.1", ordered, 1);
+            checkStateDbRoute("Vnet11", "100.100.2.1/32", "11.0.0.1");
+
+            // route3: single endpoint 11.0.0.2 / monitor 11.1.0.2 (shares
+            // monitor 11.1.0.2 with route2). Still down -> not programmed.
+            setVnetRouteMonitored("Vnet11", "100.100.3.1/32", "11.0.0.2", "11.1.0.2");
+            EXPECT_EQ(findRoute("100.100.3.1"), nullptr);
+            checkStateDbRoute("Vnet11", "100.100.3.1/32", "");
+
+            // Monitor 11.1.0.2 up: route3 programmed (single next hop), and
+            // route2 grows to both endpoints (sequence ids 1 and 2).
+            updateBfdSessionState("11.1.0.2", SAI_BFD_SESSION_STATE_UP);
+            ASSERT_NE(findRoute("100.100.3.1"), nullptr);
+            checkStateDbRoute("Vnet11", "100.100.3.1/32", "11.0.0.2");
+            EXPECT_EQ(activeMembers(nhg2), 2U);
+            checkGroupMember(nhg2, "11.0.0.1", ordered, 1);
+            checkGroupMember(nhg2, "11.0.0.2", ordered, 2);
+            checkStateDbRoute("Vnet11", "100.100.2.1/32", "11.0.0.1,11.0.0.2");
+
+            // Monitor 11.1.0.1 down: route2 keeps only 11.0.0.2 (sequence id 2
+            // -- the sorted position is preserved even though 11.0.0.1 is
+            // gone), and route1 (whose only endpoint used 11.1.0.1) is
+            // deprogrammed.
+            updateBfdSessionState("11.1.0.1", SAI_BFD_SESSION_STATE_DOWN);
+            EXPECT_EQ(activeMembers(nhg2), 1U);
+            checkGroupMember(nhg2, "11.0.0.2", ordered, 2);
+            checkStateDbRoute("Vnet11", "100.100.2.1/32", "11.0.0.2");
+            checkStateDbRoute("Vnet11", "100.100.1.1/32", "");
+
+            // Repoint route1 at a new endpoint 11.0.0.2 / monitor 11.1.0.2
+            // (already up): route1 comes back over a single next hop, route3 is
+            // unaffected.
+            setVnetRouteMonitored("Vnet11", "100.100.1.1/32", "11.0.0.2", "11.1.0.2");
+            ASSERT_NE(findRoute("100.100.1.1"), nullptr);
+            checkStateDbRoute("Vnet11", "100.100.1.1/32", "11.0.0.2");
+            checkStateDbRoute("Vnet11", "100.100.3.1/32", "11.0.0.2");
+
+            // Delete route2: its group is removed, and monitor 11.1.0.1 -- now
+            // referenced by no route (route1 moved off it) -- has its BFD
+            // session removed, while 11.1.0.2 (route1/route3) survives.
+            delVnetRouteMonitored("Vnet11", "100.100.2.1/32");
+            EXPECT_NE(find(m_rt.removedGroups.begin(), m_rt.removedGroups.end(), nhg2),
+                      m_rt.removedGroups.end());
+            checkStateDbRouteRemoved("Vnet11", "100.100.2.1/32");
+            EXPECT_FALSE(bfdSessionExists("11.1.0.1"));
+            EXPECT_TRUE(bfdSessionExists("11.1.0.2"));
+
+            // Delete route1: 11.1.0.2 still referenced by route3, so it
+            // survives.
+            delVnetRouteMonitored("Vnet11", "100.100.1.1/32");
+            checkStateDbRouteRemoved("Vnet11", "100.100.1.1/32");
+            EXPECT_TRUE(bfdSessionExists("11.1.0.2"));
+
+            // Delete route3: the last reference to 11.1.0.2 is gone.
+            delVnetRouteMonitored("Vnet11", "100.100.3.1/32");
+            checkStateDbRouteRemoved("Vnet11", "100.100.3.1/32");
+            EXPECT_FALSE(bfdSessionExists("11.1.0.2"));
+        }
+
+
         // VNET's IPv6 link-local (fe80::/10) route that RouteOrch programs during
         // bind -- its address never matches a VNET route's endpoint prefix.
         const RouteCaptures::Route *findRoute(const string &ip) const
@@ -1721,5 +1872,22 @@ namespace vnetorch_test
         checkStateDbRouteRemoved("Vnet12", "100.100.1.1/32");
         for (const char *mon : {"12.1.0.1", "12.1.0.2", "12.1.0.3", "12.1.0.4"})
             EXPECT_FALSE(bfdSessionExists(mon)) << "BFD session " << mon << " not removed";
+    }
+
+    // Mixed single-endpoint and ECMP BFD-monitored routes that share BFD
+    // sessions -- the mock equivalent of test_vnet_orch_11. A single-endpoint
+    // monitored route programs one tunnel next hop (no group); an overlapping
+    // ECMP monitored route programs a group whose members follow BFD state; and
+    // a monitor shared between routes is a single ref-counted BFD session. Run
+    // for both unordered and ordered ECMP (ordered adds per-member sequence
+    // IDs), mirroring the VS test's ordered_ecmp parametrization.
+    TEST_F(VNetOrchTest, VnetMixedMonitoredRoutesUnorderedEcmp)
+    {
+        runMixedMonitoredRoutes(/*ordered=*/false);
+    }
+
+    TEST_F(VNetOrchTest, VnetMixedMonitoredRoutesOrderedEcmp)
+    {
+        runMixedMonitoredRoutes(/*ordered=*/true);
     }
 }
