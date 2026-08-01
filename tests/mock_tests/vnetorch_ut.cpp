@@ -1304,6 +1304,75 @@ namespace vnetorch_test
             EXPECT_FALSE(tbl.get(monitor + ":" + prefix, fvs))
                 << "APP_DB monitor session " << monitor << ":" << prefix << " not removed";
         }
+
+        // The subset of the given endpoint IPs that currently have an active
+        // (non-removed) next hop. A local endpoint's IP next hop persists once
+        // gNeighOrch creates it; a remote endpoint's tunnel-encap next hop is
+        // removed once the priority route stops using it. This is the mock view
+        // of the ASIC_DB next hops (filtered by SAI_NEXT_HOP_ATTR_IP -- both
+        // IP and tunnel-encap next hops carry it) that test_vnet_orch_28 counts.
+        set<string> activeEndpointNexthops(const vector<string> &candidates) const
+        {
+            set<string> result;
+            for (const auto &ip : candidates)
+                for (const auto &nh : m_rt.nexthops)
+                    if (ipAddrEquals(nh.ip, ip) &&
+                        find(m_rt.removedNexthops.begin(), m_rt.removedNexthops.end(),
+                             nh.oid) == m_rt.removedNexthops.end())
+                        result.insert(ip);
+            return result;
+        }
+
+        // Assert the tunnel-termination ACL rule VNetRouteOrch programs for a
+        // local endpoint. VNetTunnelTermAcl writes the redirect rule into APP_DB
+        // ACL_RULE_TABLE (consumed by AclOrch, whose APP_DB->SAI translation is
+        // covered by aclorch_ut) with priority 9998, a DST_IP match on the route
+        // VIP, TUNNEL_TERM=true and a redirect to the local endpoint IP; the
+        // ACL_TABLE_TYPE it defines carries the REDIRECT + COUNTER actions. Mock
+        // equivalent of dvs_acl.verify_redirect_acl_rule +
+        // verify_acl_table_action_list, at the VNet->ACL (APP_DB) boundary
+        // (the VS test asserts the resulting SAI ACL entry in ASIC_DB).
+        void checkTunnelTermAclRule(const string &vnet, const string &prefix,
+                                    const string &redirectIp)
+        {
+            string ruleName = string(VNET_TUNNEL_TERM_ACL_TABLE) + ":" + vnet + "_" +
+                              prefix + "_" + VNET_TUNNEL_TERM_ACL_RULE_NAME_SUFFIX;
+            Table ruleTbl(m_app_db.get(), APP_ACL_RULE_TABLE_NAME);
+            vector<FieldValueTuple> fvs;
+            ASSERT_TRUE(ruleTbl.get(ruleName, fvs))
+                << "missing tunnel-term ACL rule " << ruleName;
+            map<string, string> f;
+            for (const auto &fv : fvs) f[fvField(fv)] = fvValue(fv);
+            EXPECT_EQ(f[RULE_PRIORITY], to_string(VNET_TUNNEL_TERM_ACL_BASE_PRIORITY));
+            EXPECT_EQ(f[MATCH_DST_IP], prefix);
+            EXPECT_EQ(f[MATCH_TUNNEL_TERM], "true");
+            EXPECT_EQ(f[ACTION_REDIRECT_ACTION], redirectIp);
+
+            Table typeTbl(m_app_db.get(), APP_ACL_TABLE_TYPE_TABLE_NAME);
+            vector<FieldValueTuple> typeFvs;
+            ASSERT_TRUE(typeTbl.get(VNET_TUNNEL_TERM_ACL_TABLE_TYPE, typeFvs))
+                << "missing tunnel-term ACL table type";
+            string actions;
+            for (const auto &fv : typeFvs)
+                if (fvField(fv) == ACL_TABLE_TYPE_ACTIONS) actions = fvValue(fv);
+            EXPECT_NE(actions.find(ACTION_REDIRECT_ACTION), string::npos)
+                << "ACL table type actions missing REDIRECT_ACTION: " << actions;
+            EXPECT_NE(actions.find(ACTION_COUNTER), string::npos)
+                << "ACL table type actions missing COUNTER: " << actions;
+        }
+
+        // Assert no tunnel-term ACL rule exists yet -- dvs_acl.verify_no_acl_rules()
+        // equivalent, scoped to the VNET local-endpoint redirect table.
+        void checkNoTunnelTermAclRules()
+        {
+            Table ruleTbl(m_app_db.get(), APP_ACL_RULE_TABLE_NAME);
+            vector<string> keys;
+            ruleTbl.getKeys(keys);
+            for (const auto &k : keys)
+                EXPECT_NE(k.find(string(VNET_TUNNEL_TERM_ACL_TABLE) + ":"), 0U)
+                    << "unexpected tunnel-term ACL rule " << k
+                    << " before route creation";
+        }
     };
 
     // Minimal end-to-end check that the fixture drives VNetOrch: creating a VNET
@@ -2824,6 +2893,111 @@ namespace vnetorch_test
         checkStateDbRouteRemoved("Vnet29", "100.100.1.1/32");
         checkRouteNotAdvertised("100.100.1.0/24");
         for (const char *m : {"9.1.0.1", "9.1.0.2", "9.1.0.3", "9.1.0.4"})
+            checkCustomMonitorDeleted("100.100.1.1/32", m);
+    }
+
+    // Mock equivalent of test_vnet_orch_28: a custom-monitored priority route
+    // with a directly-connected/local primary endpoint, exercising the
+    // tunnel-termination ACL VNetRouteOrch programs for local endpoints.
+    // Endpoints {9.1.0.1 (local), 9.1.0.2 (remote)}, primary 9.1.0.1, monitored
+    // by {9.1.0.3->9.1.0.1, 9.1.0.4->9.1.0.2}. Unique coverage vs the other
+    // priority tests: (a) no tunnel-term ACL rule exists before the route;
+    // (b) creating the route programs a redirect ACL rule (DST_IP=vip,
+    // TUNNEL_TERM, redirect to the local endpoint, priority 9998) whose table
+    // type carries the REDIRECT + COUNTER actions -- even before any monitor is
+    // up, since the ACL follows the local endpoint, not route health; (c) the
+    // local endpoint's next hop persists across a primary->secondary->primary
+    // flap while the remote endpoint's tunnel next hop is created/removed on
+    // demand (active next-hop set 1->2->1). The ACL rule's APP_DB->SAI
+    // translation is covered by aclorch_ut; here we assert the VNet->ACL
+    // (APP_DB) boundary (the VS test asserts the resulting SAI ACL entry).
+    TEST_F(VNetOrchTest, VnetPriorityRouteLocalPrimaryTunnelTermAcl)
+    {
+        setVxlanTunnel("tunnel_28", "9.9.9.9");
+        setVnet("Vnet28", "tunnel_28", "10028", "", /*advertise_prefix=*/true,
+                /*overlay_dmac=*/"22:33:33:44:44:66");
+
+        // No tunnel-term ACL rule before any route is created.
+        checkNoTunnelTermAclRules();
+
+        // Directly-connected local primary endpoint 9.1.0.1 on Ethernet8.
+        createL3Interface("Ethernet8", "9.1.0.1/32");
+        addNeighbor("Ethernet8", "9.1.0.1", "00:01:02:03:04:05");
+        checkEndpointIsLocal("9.1.0.1");
+
+        // Route: local primary {9.1.0.1}, remote secondary {9.1.0.2}, custom
+        // monitored by {9.1.0.3->9.1.0.1, 9.1.0.4->9.1.0.2}.
+        setVnetRoutePriority("Vnet28", "100.100.1.1/32", "9.1.0.1,9.1.0.2",
+                             "9.1.0.3,9.1.0.4", /*primary=*/"9.1.0.1",
+                             /*monitoring=*/"custom",
+                             /*adv_prefix=*/"100.100.1.0/24",
+                             /*profile=*/"Test_profile",
+                             /*check_directly_connected=*/true);
+
+        // The route programs the tunnel-term redirect ACL for the local primary
+        // even before any monitor is up: DST_IP=vip, redirect to 9.1.0.1,
+        // priority 9998; table type actions = REDIRECT + COUNTER.
+        checkTunnelTermAclRule("Vnet28", "100.100.1.1/32", "9.1.0.1");
+
+        // Monitors default down: route not programmed, prefix not advertised.
+        for (const char *m : {"9.1.0.3", "9.1.0.4"})
+            checkCustomMonitorAppDb("100.100.1.1/32", m, "vxlan", "22:33:33:44:44:66");
+        EXPECT_EQ(findRoute("100.100.1.1"), nullptr);
+        checkStateDbRoute("Vnet28", "100.100.1.1/32", "");
+        checkRouteNotAdvertised("100.100.1.0/24");
+
+        // Both monitors up: only the local primary 9.1.0.1 is used; the remote
+        // secondary's tunnel next hop is not created (active next-hop set {1}).
+        updateMonitorSessionState("100.100.1.1/32", "9.1.0.3", "up");
+        updateMonitorSessionState("100.100.1.1/32", "9.1.0.4", "up");
+        checkPriorityRoute("100.100.1.1", {"9.1.0.1"});
+        checkEndpointIsLocal("9.1.0.1");
+        EXPECT_EQ(activeEndpointNexthops({"9.1.0.1", "9.1.0.2"}),
+                  (set<string>{"9.1.0.1"}));
+        checkStateDbRoute("Vnet28", "100.100.1.1/32", "9.1.0.1");
+        checkRouteAdvertised("100.100.1.0/24", "Test_profile");
+
+        // Secondary monitor down does not affect the primary-active route.
+        updateMonitorSessionState("100.100.1.1/32", "9.1.0.4", "down");
+        checkPriorityRoute("100.100.1.1", {"9.1.0.1"});
+        checkStateDbRoute("Vnet28", "100.100.1.1/32", "9.1.0.1");
+        checkRouteAdvertised("100.100.1.0/24", "Test_profile");
+
+        // Primary down, secondary up: fail over to the remote secondary 9.1.0.2.
+        // Its tunnel next hop is now created; the local next hop persists
+        // (active next-hop set {1,2}).
+        updateMonitorSessionState("100.100.1.1/32", "9.1.0.3", "down");
+        updateMonitorSessionState("100.100.1.1/32", "9.1.0.4", "up");
+        checkPriorityRoute("100.100.1.1", {"9.1.0.2"});
+        checkEndpointIsRemote("9.1.0.2");
+        EXPECT_EQ(activeEndpointNexthops({"9.1.0.1", "9.1.0.2"}),
+                  (set<string>{"9.1.0.1", "9.1.0.2"}));
+        checkStateDbRoute("Vnet28", "100.100.1.1/32", "9.1.0.2");
+        checkRouteAdvertised("100.100.1.0/24", "Test_profile");
+
+        // Primary back up: switch back to the local primary; the remote tunnel
+        // next hop is removed while the local one persists (active set {1}).
+        updateMonitorSessionState("100.100.1.1/32", "9.1.0.3", "up");
+        checkPriorityRoute("100.100.1.1", {"9.1.0.1"});
+        checkEndpointIsLocal("9.1.0.1");
+        EXPECT_EQ(activeEndpointNexthops({"9.1.0.1", "9.1.0.2"}),
+                  (set<string>{"9.1.0.1"}));
+        checkStateDbRoute("Vnet28", "100.100.1.1/32", "9.1.0.1");
+        checkRouteAdvertised("100.100.1.0/24", "Test_profile");
+
+        // All monitors down: route withdrawn, advertisement removed.
+        updateMonitorSessionState("100.100.1.1/32", "9.1.0.3", "down");
+        updateMonitorSessionState("100.100.1.1/32", "9.1.0.4", "down");
+        EXPECT_EQ(findRoute("100.100.1.1"), nullptr);
+        checkStateDbRouteRemoved("Vnet28", "100.100.1.1/32");
+        checkRouteNotAdvertised("100.100.1.0/24");
+
+        // Delete the route: withdrawn, STATE_DB cleared, monitors removed.
+        delVnetRoute("Vnet28", "100.100.1.1/32");
+        EXPECT_EQ(findRoute("100.100.1.1"), nullptr);
+        checkStateDbRouteRemoved("Vnet28", "100.100.1.1/32");
+        checkRouteNotAdvertised("100.100.1.0/24");
+        for (const char *m : {"9.1.0.3", "9.1.0.4"})
             checkCustomMonitorDeleted("100.100.1.1/32", m);
     }
 }
