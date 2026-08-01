@@ -7,6 +7,7 @@
 #include "mock_table.h"
 #include "macaddress.h"
 #include "sai_serialize.h"
+#include "saihelper.h"
 
 #include <gtest/gtest.h>
 
@@ -227,6 +228,10 @@ namespace vnetorch_test
         vector<sai_object_id_t> removedGroups;
         vector<sai_object_id_t> removedMembers;
         vector<sai_ip_prefix_t> removedRoutes;
+        // Per-entry statuses libsaivs returned for the most recent bulk route
+        // create -- used by the duplicate-route regression test to prove the
+        // conflicting create actually hit an ITEM_ALREADY_EXISTS/NOT_EXECUTED.
+        vector<sai_status_t> lastBulkCreateStatuses;
     };
 
     // Captured SAI BFD sessions gBfdOrch programs for a monitored VNET route's
@@ -303,6 +308,7 @@ namespace vnetorch_test
                                                     attr_list, mode, statuses);
         if (g_activeRouteCaptures)
         {
+            g_activeRouteCaptures->lastBulkCreateStatuses.assign(statuses, statuses + count);
             for (uint32_t i = 0; i < count; ++i)
             {
                 if (statuses[i] != SAI_STATUS_SUCCESS) continue;
@@ -1371,6 +1377,32 @@ namespace vnetorch_test
             neighTable.set(port + ":" + ip, {{"neigh", mac}, {"family", "IPv4"}});
             gNeighOrch->addExistingData(&neighTable);
             static_cast<Orch *>(gNeighOrch)->doTask();
+        }
+
+        // Substitute a regular (FRR/fpmsyncd) route by writing APP_DB ROUTE_TABLE
+        // and driving gRouteOrch. fpmsyncd normally produces this from a zebra FPM
+        // message; that netlink->APP_DB translation is covered by test_route +
+        // tests_fpmsyncd (plan Sec 8.4), so the mock writes the entry directly.
+        // RouteOrch needs at least nexthop + ifname (an empty ifname is skipped).
+        void setRoute(const string &prefix, const string &nexthop, const string &ifname)
+        {
+            Table tbl(m_app_db.get(), APP_ROUTE_TABLE_NAME);
+            tbl.set(prefix, {{"nexthop", nexthop}, {"ifname", ifname}});
+            gRouteOrch->addExistingData(&tbl);
+            static_cast<Orch *>(gRouteOrch)->doTask();
+        }
+
+        // Remove a regular (RouteOrch) route via a DEL_COMMAND Consumer push --
+        // the fpmsyncd route-withdraw equivalent. As with delVnetRoute, also drop
+        // the backing row so a later addExistingData() cannot resurrect it.
+        void delRoute(const string &prefix)
+        {
+            auto consumer = dynamic_cast<Consumer *>(
+                gRouteOrch->getExecutor(APP_ROUTE_TABLE_NAME));
+            consumer->addToSync({{prefix, DEL_COMMAND, {}}});
+            static_cast<Orch *>(gRouteOrch)->doTask(*consumer);
+            Table tbl(m_app_db.get(), APP_ROUTE_TABLE_NAME);
+            tbl.del(prefix);
         }
 
         // Assert the (still-present) next hop for endpoint ip carries the given
@@ -4393,6 +4425,88 @@ namespace vnetorch_test
         EXPECT_EQ(m_tun.removedTunnels.size(), 1U);
         EXPECT_EQ(m_tun.removedMaps.size(), 4U);
         EXPECT_EQ(m_tun.removedTerms.size(), 1U);
+    }
+
+    // Mock equivalent of test_vnet_orch_24 -- the duplicate-route regression from
+    // commit 6e25014c ("Handle duplicate routes in a graceful manner"). A
+    // default-scope VNET programs a tunnel route for 100.100.1.0/24 directly in
+    // the default virtual router (gVirtualRouterId, via the single
+    // create_route_entry). A regular route for the SAME prefix -- normally
+    // learned via FRR/BGP and delivered by fpmsyncd, here substituted as a direct
+    // APP_DB ROUTE_TABLE write (that netlink->APP_DB translation is covered by
+    // test_route + tests_fpmsyncd, plan Sec 8.4) -- then drives gRouteOrch, which
+    // is unaware of the VNET route and tries to program the same prefix in the
+    // same VR. libsaivs returns SAI_STATUS_ITEM_ALREADY_EXISTS (or NOT_EXECUTED
+    // for the other entries of a multi-route bulk) for that create, and
+    // handleSaiCreateStatus must treat it as success instead of calling
+    // handleSaiFailure (which records an unhealthy status + logs "Encountered
+    // failure in create operation"). The VS test asserts this via check_syslog
+    // for the ABSENCE of that failure message; the mock equivalent is
+    // getSaiFailureStatus() staying false. The remove side is symmetric
+    // (handleSaiRemoveStatus with ITEM_NOT_FOUND/NOT_EXECUTED). The captured
+    // duplicate status proves the conflicting create was really exercised, and
+    // the surviving route entry is the check_route_entries equivalent.
+    TEST_F(VNetOrchTest, VnetDuplicateRouteHandledGracefully)
+    {
+        // scope=default -> the VNET reuses gVirtualRouterId (no VR of its own).
+        EXPECT_CALL(*mock_sai_virtual_router_api, create_virtual_router).Times(0);
+
+        setVxlanTunnel("tunnel_24", "10.10.10.10");
+        setVnet("Vnet_2000", "tunnel_24", "2000", "", false, "", "default");
+
+        // The VNET tunnel route is programmed directly in the default VR as a
+        // tunnel route to the (remote) endpoint 10.10.10.3.
+        setVnetRoute("Vnet_2000", "100.100.1.0/24", "10.10.10.3");
+        const RouteCaptures::Route *vnetRoute = findRoute("100.100.1.0");
+        ASSERT_NE(vnetRoute, nullptr);
+        EXPECT_EQ(vnetRoute->vr, gVirtualRouterId);
+
+        // Bring up Ethernet0 in the default VRF and resolve 10.10.10.3 as a local
+        // neighbor so the substituted regular route's next hop resolves.
+        createL3Interface("Ethernet0", "10.10.10.1/24");
+        setPortOperStatus("Ethernet0", SAI_PORT_OPER_STATUS_UP);
+        addNeighbor("Ethernet0", "10.10.10.3", "00:00:00:00:00:03");
+
+        // Clear any stale unhealthy flag so this window observes only our ops.
+        setSaiFailureStatus(false, "");
+
+        // Substitute the FRR route (vtysh "ip route 100.100.1.0/24 10.10.10.3"):
+        // RouteOrch tries to program the same prefix in the same (default) VR ->
+        // libsaivs duplicate.
+        m_rt.lastBulkCreateStatuses.clear();
+        setRoute("100.100.1.0/24", "10.10.10.3", "Ethernet0");
+
+        // The conflicting create really hit a duplicate (regression path
+        // exercised): libsaivs returns ITEM_ALREADY_EXISTS for the same
+        // (VR, prefix).
+        bool sawDup = false;
+        for (auto s : m_rt.lastBulkCreateStatuses)
+            if (s == SAI_STATUS_ITEM_ALREADY_EXISTS || s == SAI_STATUS_NOT_EXECUTED)
+                sawDup = true;
+        EXPECT_TRUE(sawDup) << "expected the duplicate route create to return "
+                               "ITEM_ALREADY_EXISTS/NOT_EXECUTED from libsaivs";
+
+        // The mock equivalent of the VS check_syslog: handleSaiCreateStatus
+        // swallowed the duplicate, so orchagent recorded no SAI failure. Without
+        // the graceful handling this flag would be set and the failure logged.
+        std::string saiErr;
+        EXPECT_FALSE(getSaiFailureStatus(saiErr))
+            << "unexpected SAI failure on duplicate route create: " << saiErr;
+
+        // Route still present (check_route_entries equivalent).
+        EXPECT_NE(findRoute("100.100.1.0"), nullptr);
+
+        // Tear down mirroring the VS order (remove FRR route, then the VNET
+        // route) -- exercising the graceful *remove* path: the second remove of
+        // the now-shared prefix returns ITEM_NOT_FOUND/NOT_EXECUTED, which
+        // handleSaiRemoveStatus must also swallow.
+        delRoute("100.100.1.0/24");
+        delVnetRoute("Vnet_2000", "100.100.1.0/24");
+        EXPECT_FALSE(getSaiFailureStatus(saiErr))
+            << "unexpected SAI failure on duplicate route remove: " << saiErr;
+
+        delVnet("Vnet_2000");
+        delVxlanTunnel("tunnel_24");
     }
 
     // A (non-default-scope) VNET VR gets an IPv6 link-local (fe80::/10) trap
