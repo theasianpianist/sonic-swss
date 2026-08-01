@@ -291,6 +291,12 @@ namespace vnetorch_test
         unique_ptr<VNetRouteOrch> m_vnetRouteOrch;
         RouteCaptures m_rt;
 
+        // Consumes STATE_DB VNET_MONITOR_TABLE (the table update_monitor_session_
+        // state() writes) and forwards each up/down to VNetRouteOrch, exactly as
+        // orchdaemon's gMonitorOrch does. Custom-monitored (non-BFD) priority
+        // routes are driven entirely through this path.
+        unique_ptr<MonitorOrch> m_monitorOrch;
+
         // BfdOrch::doTask() consults gDirectory for a BgpGlobalStateOrch and,
         // when it is absent, defaults to *software* BFD -- programming STATE_DB
         // instead of creating a SAI hardware session. orchdaemon always
@@ -382,12 +388,21 @@ namespace vnetorch_test
                 APP_VNET_RT_TABLE_NAME, APP_VNET_RT_TUNNEL_TABLE_NAME};
             m_vnetRouteOrch = make_unique<VNetRouteOrch>(
                 m_app_db.get(), vnet_route_tables, m_vnetOrch);
+
+            // MonitorOrch::addOperation resolves VNetRouteOrch via gDirectory
+            // (as does VNetOrch on an overlay_dmac change), so register it the
+            // same way orchdaemon does. gDirectory is cleared by the base
+            // teardown after PreTearDown, so no stale pointer survives the test.
+            gDirectory.set(m_vnetRouteOrch.get());
+            m_monitorOrch = make_unique<MonitorOrch>(
+                m_state_db.get(), STATE_VNET_MONITOR_TABLE_NAME);
         }
 
         void PreTearDown() override
         {
             // Tear the route orch down before gBfdOrch: it attached to gBfdOrch
             // in its ctor and relies on gBfdOrch staying alive until it is gone.
+            m_monitorOrch.reset();
             m_vnetRouteOrch.reset();
             delete gBfdOrch;
             gBfdOrch = nullptr;
@@ -679,11 +694,13 @@ namespace vnetorch_test
         }
 
         void setVnet(const string &name, const string &tunnel, const string &vni,
-                     const string &peer_list, bool advertise_prefix = false)
+                     const string &peer_list, bool advertise_prefix = false,
+                     const string &overlay_dmac = "")
         {
             vector<FieldValueTuple> fvs = {{"vxlan_tunnel", tunnel}, {"vni", vni},
                                            {"peer_list", peer_list}};
             if (advertise_prefix) fvs.push_back({"advertise_prefix", "true"});
+            if (!overlay_dmac.empty()) fvs.push_back({"overlay_dmac", overlay_dmac});
             Table tbl(m_app_db.get(), APP_VNET_TABLE_NAME);
             tbl.set(name, fvs);
             m_vnetOrch->addExistingData(&tbl);
@@ -762,6 +779,50 @@ namespace vnetorch_test
         {
             delVnetRoute(vnet, prefix);
             syncBfd();
+        }
+
+        // A priority (primary/secondary) custom-monitored VNET route. The VS
+        // test writes VNET_ROUTE_TUNNEL with endpoint (all endpoints),
+        // endpoint_monitor, primary (the subset preferred while any of them is
+        // up), monitoring ("custom" or "custom_bfd") and optionally adv_prefix.
+        // Endpoints not in primary form the secondary group. For "custom"
+        // monitoring VNetRouteOrch writes an APP_DB VNET_MONITOR_TABLE row per
+        // endpoint and waits for STATE_DB monitor updates (see
+        // updateMonitorSessionState); for "custom_bfd" it also creates SAI BFD
+        // sessions, so we flush those into gBfdOrch.
+        void setVnetRoutePriority(const string &vnet, const string &prefix,
+                                  const string &endpoints, const string &monitors,
+                                  const string &primary,
+                                  const string &monitoring = "custom",
+                                  const string &adv_prefix = "")
+        {
+            vector<FieldValueTuple> fvs = {{"endpoint", endpoints},
+                                           {"endpoint_monitor", monitors},
+                                           {"primary", primary},
+                                           {"monitoring", monitoring}};
+            if (!adv_prefix.empty()) fvs.push_back({"adv_prefix", adv_prefix});
+            Table tbl(m_app_db.get(), APP_VNET_RT_TUNNEL_TABLE_NAME);
+            tbl.set(vnet + ":" + prefix, fvs);
+            m_vnetRouteOrch->addExistingData(&tbl);
+            static_cast<Orch *>(m_vnetRouteOrch.get())->doTask();
+            if (monitoring == "custom_bfd") syncBfd();
+        }
+
+        // Drive a custom-monitor endpoint up/down, the mock equivalent of
+        // vnet_lib.update_monitor_session_state(): write STATE_DB
+        // VNET_MONITOR_TABLE key "monitor|prefix" and deliver it to MonitorOrch,
+        // which forwards the state to VNetRouteOrch. Pushed through the consumer
+        // as a single SET so only the changed monitor is (re)processed, rather
+        // than replaying every row via addExistingData().
+        void updateMonitorSessionState(const string &prefix, const string &monitor,
+                                       const string &state)
+        {
+            Table tbl(m_state_db.get(), STATE_VNET_MONITOR_TABLE_NAME);
+            tbl.set(monitor + "|" + prefix, {{"state", state}});
+            auto consumer = dynamic_cast<Consumer *>(
+                m_monitorOrch->getExecutor(STATE_VNET_MONITOR_TABLE_NAME));
+            consumer->addToSync({{monitor + "|" + prefix, SET_COMMAND, {{"state", state}}}});
+            static_cast<Orch *>(m_monitorOrch.get())->doTask(*consumer);
         }
 
         // Deliver the APP_BFD_SESSION_TABLE changes VNetRouteOrch's producer made
@@ -1012,16 +1073,30 @@ namespace vnetorch_test
 
         // VNET's IPv6 link-local (fe80::/10) route that RouteOrch programs during
         // bind -- its address never matches a VNET route's endpoint prefix.
+        //
+        // Routes are captured append-only: a create pushes a Route, a remove
+        // records the dest in removedRoutes (the Route entry is left in place),
+        // and an in-place repoint updates next_hop_id on every entry matching the
+        // dest. A priority route can be removed and re-added within one test, so
+        // return the *currently active* route for the prefix -- the last created
+        // entry, and only when it has been created more times than removed.
         const RouteCaptures::Route *findRoute(const string &ip) const
         {
+            size_t creates = 0, removes = 0;
+            const RouteCaptures::Route *last = nullptr;
             for (const auto &r : m_rt.routes)
             {
                 if (prefixAddrEquals(r.dest, ip))
                 {
-                    return &r;
+                    creates++;
+                    last = &r;
                 }
             }
-            return nullptr;
+            for (const auto &d : m_rt.removedRoutes)
+            {
+                if (prefixAddrEquals(d, ip)) removes++;
+            }
+            return creates > removes ? last : nullptr;
         }
 
         // STATE_DB VNET_ROUTE_TUNNEL_TABLE assertions -- the mock equivalent of
@@ -1086,6 +1161,77 @@ namespace vnetorch_test
                     if (fvField(fv) == "profile") value = fvValue(fv);
                 EXPECT_EQ(value, profile);
             }
+        }
+
+        // Assert the SAI programming for a priority/custom-monitored route --
+        // vnet_lib.check_priority_vnet_ecmp_routes(). With a single active
+        // endpoint the route points directly at that endpoint's tunnel next hop
+        // (no group); with several it points at an ECMP group whose active
+        // members are exactly those endpoints. The authoritative active-endpoint
+        // set is checked separately via checkStateDbRoute().
+        void checkPriorityRoute(const string &prefix, const vector<string> &activeEndpoints,
+                                bool ordered = false)
+        {
+            const RouteCaptures::Route *r = findRoute(prefix);
+            ASSERT_NE(r, nullptr) << "no route for prefix " << prefix;
+            if (activeEndpoints.size() == 1)
+            {
+                bool found = false;
+                for (const auto &nh : m_rt.nexthops)
+                {
+                    if (nh.oid == r->next_hop_id && ipAddrEquals(nh.ip, activeEndpoints[0]))
+                    {
+                        found = true;
+                        break;
+                    }
+                }
+                EXPECT_TRUE(found) << "route " << prefix
+                                   << " not pointing at tunnel next hop for "
+                                   << activeEndpoints[0];
+            }
+            else
+            {
+                sai_object_id_t nhg = r->next_hop_id;
+                int32_t type = -1;
+                for (const auto &g : m_rt.groups)
+                    if (g.oid == nhg) type = g.type;
+                EXPECT_EQ(type, SAI_NEXT_HOP_GROUP_TYPE_ECMP)
+                    << "priority route " << prefix << " group is not unordered ECMP";
+                EXPECT_EQ(activeMembers(nhg), activeEndpoints.size());
+                for (size_t i = 0; i < activeEndpoints.size(); i++)
+                    checkGroupMember(nhg, activeEndpoints[i], ordered, (uint32_t)(i + 1));
+            }
+        }
+
+        // APP_DB VNET_MONITOR_TABLE assertions -- the monitor sessions
+        // VNetRouteOrch writes for custom-monitored endpoints. Key is
+        // "monitor:prefix". Mock equivalent of
+        // vnet_lib.check_custom_monitor_app_db().
+        void checkCustomMonitorAppDb(const string &prefix, const string &monitor,
+                                     const string &packet_type, const string &overlay_dmac)
+        {
+            Table tbl(m_app_db.get(), APP_VNET_MONITOR_TABLE_NAME);
+            vector<FieldValueTuple> fvs;
+            ASSERT_TRUE(tbl.get(monitor + ":" + prefix, fvs))
+                << "missing APP_DB monitor session " << monitor << ":" << prefix;
+            string pt, dmac;
+            for (const auto &fv : fvs)
+            {
+                if (fvField(fv) == "packet_type") pt = fvValue(fv);
+                else if (fvField(fv) == "overlay_dmac") dmac = fvValue(fv);
+            }
+            EXPECT_EQ(pt, packet_type);
+            EXPECT_EQ(dmac, overlay_dmac);
+        }
+
+        // Assert a custom-monitor session's APP_DB row is gone --
+        // vnet_lib.check_custom_monitor_deleted().
+        void checkCustomMonitorDeleted(const string &prefix, const string &monitor)
+        {
+            Table tbl(m_app_db.get(), APP_VNET_MONITOR_TABLE_NAME);
+            vector<FieldValueTuple> fvs;
+            EXPECT_FALSE(tbl.get(monitor + ":" + prefix, fvs))
+                << "APP_DB monitor session " << monitor << ":" << prefix << " not removed";
         }
     };
 
@@ -1889,5 +2035,112 @@ namespace vnetorch_test
     TEST_F(VNetOrchTest, VnetMixedMonitoredRoutesOrderedEcmp)
     {
         runMixedMonitoredRoutes(/*ordered=*/true);
+    }
+
+    // Priority (primary/secondary) custom-monitored VNET route failover -- the
+    // mock equivalent of test_vnet_orch_18. Four endpoints with the first two as
+    // primary; a per-endpoint custom monitor drives up/down through STATE_DB
+    // VNET_MONITOR_TABLE (MonitorOrch -> VNetRouteOrch), with no SAI BFD
+    // sessions. While any primary endpoint is up the route uses the active
+    // primary subset; once all primaries are down it falls back to the active
+    // secondary subset; once every endpoint is down the route is withdrawn.
+    // The route carries an adv_prefix summary that is advertised to STATE_DB
+    // ADVERTISE_NETWORK_TABLE whenever the route is active.
+    TEST_F(VNetOrchTest, VnetPriorityRouteCustomMonitorFailover)
+    {
+        setVxlanTunnel("tunnel_18", "9.9.9.9");
+        setVnet("Vnet18", "tunnel_18", "10018", "", /*advertise_prefix=*/true,
+                /*overlay_dmac=*/"22:33:33:44:44:66");
+
+        // 4 endpoints, primary = first two, custom monitoring, adv_prefix summary.
+        setVnetRoutePriority("Vnet18", "100.100.1.1/32",
+                             "9.1.0.1,9.1.0.2,9.1.0.3,9.1.0.4",
+                             "9.1.0.1,9.1.0.2,9.1.0.3,9.1.0.4",
+                             /*primary=*/"9.1.0.1,9.1.0.2",
+                             /*monitoring=*/"custom",
+                             /*adv_prefix=*/"100.100.1.0/24");
+
+        // A monitor session is written to APP_DB for every endpoint, all down;
+        // the route is not programmed and its adv_prefix is not advertised.
+        for (const char *m : {"9.1.0.1", "9.1.0.2", "9.1.0.3", "9.1.0.4"})
+            checkCustomMonitorAppDb("100.100.1.1/32", m, "vxlan", "22:33:33:44:44:66");
+        EXPECT_EQ(findRoute("100.100.1.1"), nullptr);
+        checkStateDbRoute("Vnet18", "100.100.1.1/32", "");
+        checkRouteNotAdvertised("100.100.1.0/24");
+
+        // All monitors up: only the primary subset {1,2} is used.
+        updateMonitorSessionState("100.100.1.1/32", "9.1.0.1", "up");
+        updateMonitorSessionState("100.100.1.1/32", "9.1.0.2", "up");
+        updateMonitorSessionState("100.100.1.1/32", "9.1.0.3", "up");
+        updateMonitorSessionState("100.100.1.1/32", "9.1.0.4", "up");
+        checkPriorityRoute("100.100.1.1", {"9.1.0.1", "9.1.0.2"});
+        checkStateDbRoute("Vnet18", "100.100.1.1/32", "9.1.0.1,9.1.0.2");
+        checkRouteAdvertised("100.100.1.0/24");
+
+        // First primary down: route stays on the remaining primary {1}.
+        updateMonitorSessionState("100.100.1.1/32", "9.1.0.2", "down");
+        checkPriorityRoute("100.100.1.1", {"9.1.0.1"});
+        checkStateDbRoute("Vnet18", "100.100.1.1/32", "9.1.0.1");
+        checkRouteAdvertised("100.100.1.0/24");
+
+        // Both primaries down: fall back to the secondary subset {3,4}.
+        updateMonitorSessionState("100.100.1.1/32", "9.1.0.1", "down");
+        checkPriorityRoute("100.100.1.1", {"9.1.0.3", "9.1.0.4"});
+        checkStateDbRoute("Vnet18", "100.100.1.1/32", "9.1.0.3,9.1.0.4");
+        checkRouteAdvertised("100.100.1.0/24");
+
+        // First secondary down: route stays on the remaining secondary {4}.
+        updateMonitorSessionState("100.100.1.1/32", "9.1.0.3", "down");
+        checkPriorityRoute("100.100.1.1", {"9.1.0.4"});
+        checkStateDbRoute("Vnet18", "100.100.1.1/32", "9.1.0.4");
+        checkRouteAdvertised("100.100.1.0/24");
+
+        // Last secondary down: every endpoint is down, route withdrawn.
+        updateMonitorSessionState("100.100.1.1/32", "9.1.0.4", "down");
+        EXPECT_EQ(findRoute("100.100.1.1"), nullptr);
+        checkStateDbRouteRemoved("Vnet18", "100.100.1.1/32");
+        checkRouteNotAdvertised("100.100.1.0/24");
+
+        // Secondary endpoints back up: route re-added on secondary {3,4}.
+        updateMonitorSessionState("100.100.1.1/32", "9.1.0.3", "up");
+        updateMonitorSessionState("100.100.1.1/32", "9.1.0.4", "up");
+        checkPriorityRoute("100.100.1.1", {"9.1.0.3", "9.1.0.4"});
+        checkStateDbRoute("Vnet18", "100.100.1.1/32", "9.1.0.3,9.1.0.4");
+        checkRouteAdvertised("100.100.1.0/24");
+
+        // First primary back up: route switches back to the primary {1}.
+        updateMonitorSessionState("100.100.1.1/32", "9.1.0.1", "up");
+        checkPriorityRoute("100.100.1.1", {"9.1.0.1"});
+        checkStateDbRoute("Vnet18", "100.100.1.1/32", "9.1.0.1");
+        checkRouteAdvertised("100.100.1.0/24");
+
+        // Second primary up: primary subset {1,2}.
+        updateMonitorSessionState("100.100.1.1/32", "9.1.0.2", "up");
+        checkPriorityRoute("100.100.1.1", {"9.1.0.1", "9.1.0.2"});
+        checkStateDbRoute("Vnet18", "100.100.1.1/32", "9.1.0.1,9.1.0.2");
+        checkRouteAdvertised("100.100.1.0/24");
+
+        // Secondary endpoints going down does not affect a primary-active route.
+        updateMonitorSessionState("100.100.1.1/32", "9.1.0.3", "down");
+        updateMonitorSessionState("100.100.1.1/32", "9.1.0.4", "down");
+        checkPriorityRoute("100.100.1.1", {"9.1.0.1", "9.1.0.2"});
+        checkStateDbRoute("Vnet18", "100.100.1.1/32", "9.1.0.1,9.1.0.2");
+        checkRouteAdvertised("100.100.1.0/24");
+
+        // Secondary endpoints coming back up does not affect it either.
+        updateMonitorSessionState("100.100.1.1/32", "9.1.0.3", "up");
+        updateMonitorSessionState("100.100.1.1/32", "9.1.0.4", "up");
+        checkPriorityRoute("100.100.1.1", {"9.1.0.1", "9.1.0.2"});
+        checkStateDbRoute("Vnet18", "100.100.1.1/32", "9.1.0.1,9.1.0.2");
+        checkRouteAdvertised("100.100.1.0/24");
+
+        // Delete the route: withdrawn, STATE_DB cleared, and every custom
+        // monitor session removed from APP_DB.
+        delVnetRoute("Vnet18", "100.100.1.1/32");
+        EXPECT_EQ(findRoute("100.100.1.1"), nullptr);
+        checkStateDbRouteRemoved("Vnet18", "100.100.1.1/32");
+        checkRouteNotAdvertised("100.100.1.0/24");
+        for (const char *m : {"9.1.0.1", "9.1.0.2", "9.1.0.3", "9.1.0.4"})
+            checkCustomMonitorDeleted("100.100.1.1/32", m);
     }
 }
