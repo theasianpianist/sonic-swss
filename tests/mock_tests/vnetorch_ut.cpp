@@ -172,6 +172,10 @@ namespace vnetorch_test
             sai_object_id_t vr_value = SAI_NULL_OBJECT_ID;
             uint32_t vni_key = 0;
             uint32_t vni_value = 0;
+            // VNI_TO_VLAN_ID decap map entries (VxlanTunnelMapOrch) carry a VLAN
+            // in the value slot; other map types leave these zero.
+            uint16_t vlan_key = 0;
+            uint16_t vlan_value = 0;
         };
         vector<Map> maps;
         vector<Tunnel> tunnels;
@@ -457,6 +461,12 @@ namespace vnetorch_test
         // row gBfdOrch writes.
         unique_ptr<BfdMonitorOrch> m_bfdMonitorOrch;
 
+        // Consumes APP_DB VXLAN_TUNNEL_MAP_TABLE (the table vxlanmgrd produces
+        // from CONFIG_DB VXLAN_TUNNEL_MAP), standing in for orchdaemon's
+        // gVxlanTunnelMapOrch. Programs the explicit VLAN<->VNI decap tunnel-map
+        // entries test_vnet_vxlan_multi_map adds on top of a VNET-bound tunnel.
+        unique_ptr<VxlanTunnelMapOrch> m_vxlanTunnelMapOrch;
+
         // BfdOrch::doTask() consults gDirectory for a BgpGlobalStateOrch and,
         // when it is absent, defaults to *software* BFD -- programming STATE_DB
         // instead of creating a SAI hardware session. orchdaemon always
@@ -593,12 +603,22 @@ namespace vnetorch_test
             // (already set above), so no registration of its own is needed.
             m_bfdMonitorOrch = make_unique<BfdMonitorOrch>(
                 m_state_db.get(), STATE_BFD_SESSION_TABLE_NAME);
+
+            // gVxlanTunnelMapOrch equivalent, driven off APP_DB
+            // VXLAN_TUNNEL_MAP_TABLE. Registered in gDirectory the same way
+            // orchdaemon does; the VNET-bind tunnel path never resolves it (the
+            // other 39 tests run without one), so this only affects explicit
+            // tunnel-map programming.
+            m_vxlanTunnelMapOrch = make_unique<VxlanTunnelMapOrch>(
+                m_app_db.get(), APP_VXLAN_TUNNEL_MAP_TABLE_NAME);
+            gDirectory.set(m_vxlanTunnelMapOrch.get());
         }
 
         void PreTearDown() override
         {
             // Tear the route orch down before gBfdOrch: it attached to gBfdOrch
             // in its ctor and relies on gBfdOrch staying alive until it is gone.
+            m_vxlanTunnelMapOrch.reset();
             m_bfdMonitorOrch.reset();
             m_monitorOrch.reset();
             m_vnetRouteOrch.reset();
@@ -719,6 +739,8 @@ namespace vnetorch_test
                         if (auto a = findRawAttr(l, n, SAI_TUNNEL_MAP_ENTRY_ATTR_VIRTUAL_ROUTER_ID_VALUE)) e.vr_value = a->value.oid;
                         if (auto a = findRawAttr(l, n, SAI_TUNNEL_MAP_ENTRY_ATTR_VNI_ID_KEY)) e.vni_key = a->value.u32;
                         if (auto a = findRawAttr(l, n, SAI_TUNNEL_MAP_ENTRY_ATTR_VNI_ID_VALUE)) e.vni_value = a->value.u32;
+                        if (auto a = findRawAttr(l, n, SAI_TUNNEL_MAP_ENTRY_ATTR_VLAN_ID_KEY)) e.vlan_key = a->value.u16;
+                        if (auto a = findRawAttr(l, n, SAI_TUNNEL_MAP_ENTRY_ATTR_VLAN_ID_VALUE)) e.vlan_value = a->value.u16;
                         m_tun.mapEntries.push_back(e);
                     }
                     return st;
@@ -906,6 +928,41 @@ namespace vnetorch_test
             tbl.set(name, {{"src_ip", src_ip}});
             m_VxlanTunnelOrch->addExistingData(&tbl);
             static_cast<Orch *>(m_VxlanTunnelOrch)->doTask();
+        }
+
+        // Bring up a VLAN (e.g. "Vlan1000") so VxlanTunnelMapOrch's
+        // gPortsOrch->getVlanByVlanId() succeeds. vlanmgrd normally mirrors
+        // CONFIG_DB VLAN into APP_DB VLAN_TABLE; the mock writes it directly and
+        // drives gPortsOrch, the same idiom evpnmhorch_ut uses.
+        void createVlan(const string &vlan)
+        {
+            Table tbl(m_app_db.get(), APP_VLAN_TABLE_NAME);
+            tbl.set(vlan, {{"admin_status", "up"}, {"mtu", "9100"},
+                           {"mac", "00:aa:bb:cc:dd:ee"}});
+            gPortsOrch->addExistingData(&tbl);
+            static_cast<Orch *>(gPortsOrch)->doTask();
+        }
+
+        // Add an explicit VLAN<->VNI decap tunnel-map entry, the mock equivalent
+        // of vnet_lib.create_vxlan_tunnel_map. vxlanmgrd turns CONFIG_DB
+        // VXLAN_TUNNEL_MAP|<tunnel>|<name> into APP_DB VXLAN_TUNNEL_MAP_TABLE
+        // keyed <tunnel>:<name> (the ':' VxlanTunnelMapRequest parses), so we
+        // write that and drive m_vxlanTunnelMapOrch.
+        void createVxlanTunnelMap(const string &tunnel, const string &mapName,
+                                  const string &vlan, const string &vni)
+        {
+            Table tbl(m_app_db.get(), APP_VXLAN_TUNNEL_MAP_TABLE_NAME);
+            tbl.set(tunnel + ":" + mapName, {{"vni", vni}, {"vlan", vlan}});
+            m_vxlanTunnelMapOrch->addExistingData(&tbl);
+            static_cast<Orch *>(m_vxlanTunnelMapOrch.get())->doTask();
+        }
+
+        void delVxlanTunnelMap(const string &tunnel, const string &mapName)
+        {
+            auto consumer = dynamic_cast<Consumer *>(
+                m_vxlanTunnelMapOrch->getExecutor(APP_VXLAN_TUNNEL_MAP_TABLE_NAME));
+            consumer->addToSync({{tunnel + ":" + mapName, DEL_COMMAND, {}}});
+            static_cast<Orch *>(m_vxlanTunnelMapOrch.get())->doTask(*consumer);
         }
 
         // Mirror the VS test's ordered_ecmp fixture: writing SWITCH_TABLE:switch
@@ -2065,6 +2122,67 @@ namespace vnetorch_test
         EXPECT_EQ(m_vrMock->removed_oid, vnetVr);
         EXPECT_EQ(m_tun.removedMapEntries.size(), 2U);
 
+        delVxlanTunnel("tunnel_v4");
+        EXPECT_EQ(m_tun.removedTunnels.size(), 1U);
+        EXPECT_EQ(m_tun.removedMaps.size(), 4U);
+        EXPECT_EQ(m_tun.removedTerms.size(), 1U);
+    }
+
+    // Mock equivalent of test_vnet_vxlan_multi_map: on a tunnel that a VNET has
+    // already bound (and thus activated), an explicit VXLAN_TUNNEL_MAP entry adds
+    // a further VLAN<->VNI decap tunnel-map entry on top of the VNET's VR<->VNI
+    // maps -- hence "multi map". VxlanTunnelMapOrch programs a VNI_TO_VLAN_ID map
+    // entry against the tunnel's dedicated VNI->VLAN decap map. The VS test only
+    // checks the VNET/tunnel entries and that adding the map does not disturb
+    // them; the mock additionally asserts the explicit entry's vni/vlan, then
+    // that VNET + tunnel delete still tear everything down.
+    TEST_F(VNetOrchTest, VnetVxlanMultiMap)
+    {
+        EXPECT_CALL(*mock_sai_virtual_router_api, create_virtual_router)
+            .Times(1)
+            .WillOnce(Invoke(m_vrMock.get(), &VirtualRouterSaiMock::handleCreate));
+        EXPECT_CALL(*mock_sai_virtual_router_api, remove_virtual_router)
+            .Times(1)
+            .WillOnce(Invoke(m_vrMock.get(), &VirtualRouterSaiMock::handleRemove));
+
+        setVxlanTunnel("tunnel_v4", "10.1.0.32");
+        setVnet("Vnet1", "tunnel_v4", "10001", "");
+
+        // The bind programs 4 maps + the 2 VR<->VNI entries and 1 term, exactly
+        // as VnetBindProgramsVxlanTunnel / ...TunnelMapEntries assert.
+        const sai_object_id_t vnetVr = m_vrMock->created_oid;
+        ASSERT_EQ(m_tun.maps.size(), 4U);
+        ASSERT_EQ(m_tun.mapEntries.size(), 2U);
+        EXPECT_EQ(m_tun.maps[0].type, SAI_TUNNEL_MAP_TYPE_VNI_TO_VLAN_ID);
+
+        // Add the explicit VLAN<->VNI map on the already-active tunnel. Vlan1000
+        // must exist for VxlanTunnelMapOrch's getVlanByVlanId() to resolve it.
+        createVlan("Vlan1000");
+        createVxlanTunnelMap("tunnel_v4", "map_1", "Vlan1000", "1000");
+
+        // A third tunnel-map entry appears: VNI 1000 -> VLAN 1000, against the
+        // tunnel's VNI->VLAN decap map (maps[0]). The VNET's VR<->VNI entries are
+        // untouched.
+        ASSERT_EQ(m_tun.mapEntries.size(), 3U);
+        const auto &e = m_tun.mapEntries[2];
+        EXPECT_EQ(e.map_type, SAI_TUNNEL_MAP_TYPE_VNI_TO_VLAN_ID);
+        EXPECT_EQ(e.tunnel_map, m_tun.maps[0].oid);
+        EXPECT_EQ(e.vni_key, 1000U);
+        EXPECT_EQ(e.vlan_value, 1000U);
+
+        // Deleting the VNET removes its VR + the 2 VR<->VNI entries (the explicit
+        // VLAN<->VNI entry is owned by the tunnel map, not the VNET).
+        delVnet("Vnet1");
+        EXPECT_EQ(m_vrMock->removed_oid, vnetVr);
+        EXPECT_EQ(m_tun.removedMapEntries.size(), 2U);
+
+        // The tunnel still can't be torn down while the explicit map references
+        // it (the VS test stops here, asserting nothing further). Removing the
+        // explicit VLAN<->VNI map drops that 3rd entry and releases the tunnel...
+        delVxlanTunnelMap("tunnel_v4", "map_1");
+        EXPECT_EQ(m_tun.removedMapEntries.size(), 3U);
+
+        // ...so the tunnel and its 4 maps + P2MP term now tear down cleanly.
         delVxlanTunnel("tunnel_v4");
         EXPECT_EQ(m_tun.removedTunnels.size(), 1U);
         EXPECT_EQ(m_tun.removedMaps.size(), 4U);
