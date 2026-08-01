@@ -3489,6 +3489,116 @@ namespace vnetorch_test
         delVxlanTunnel("tunnel_local_ep");
     }
 
+    // Mock equivalent of test_vnet_orch_32: a custom_bfd priority route with two
+    // primary (remote) and two secondary (directly-connected local) endpoints.
+    // Exercises the full failover cascade: primaries preferred whenever any is
+    // up, fall back to the secondary group only when both primaries are down,
+    // withdrawn entirely when all four are down, then restored primary-first as
+    // monitors return -- and secondary monitor churn never disturbs an
+    // active-primary route. The adv_prefix is a /24 summary that is advertised
+    // whenever the route is active.
+    TEST_F(VNetOrchTest, VnetCustomBfdPriorityRouteTwoPrimaryTwoSecondary)
+    {
+        setVxlanTunnel("tunnel_32", "9.9.9.9");
+        setVnet("vnet32", "tunnel_32", "10029", "", /*advertise_prefix=*/true,
+                /*overlay_dmac=*/"22:33:33:44:44:66");
+
+        // 9.1.0.3 / 9.1.0.4 are directly-connected local secondary endpoints.
+        createL3Interface("Ethernet8", "9.1.0.3/32");
+        createL3Interface("Ethernet12", "9.1.0.4/32");
+        addNeighbor("Ethernet8", "9.1.0.3", "00:01:02:03:04:05");
+        addNeighbor("Ethernet12", "9.1.0.4", "00:01:02:03:04:06");
+
+        // Primaries 9.1.0.1,9.1.0.2 (remote); secondaries 9.1.0.3,9.1.0.4
+        // (local). adv_prefix is the /24 summary of the /32 route.
+        setVnetRoutePriority("vnet32", "100.100.1.1/32",
+                             "9.1.0.1,9.1.0.2,9.1.0.3,9.1.0.4",
+                             "9.1.0.1,9.1.0.2,9.1.0.3,9.1.0.4",
+                             /*primary=*/"9.1.0.1,9.1.0.2", "custom_bfd",
+                             /*adv_prefix=*/"100.100.1.0/24", /*profile=*/"",
+                             /*check_directly_connected=*/true, 100, 100);
+
+        // Default monitor state is down -> route not programmed, STATE_DB
+        // inactive, /24 summary not advertised.
+        EXPECT_EQ(findRoute("100.100.1.1"), nullptr);
+        checkStateDbRoute("vnet32", "100.100.1.1/32", "");
+        checkRouteNotAdvertised("100.100.1.0/24");
+
+        // All four up -> only the two primaries are in use (ECMP of 2).
+        updateBfdSessionState("9.1.0.1", SAI_BFD_SESSION_STATE_UP);
+        updateBfdSessionState("9.1.0.2", SAI_BFD_SESSION_STATE_UP);
+        updateBfdSessionState("9.1.0.3", SAI_BFD_SESSION_STATE_UP);
+        updateBfdSessionState("9.1.0.4", SAI_BFD_SESSION_STATE_UP);
+        checkPriorityRoute("100.100.1.1", {"9.1.0.1", "9.1.0.2"});
+        checkStateDbRoute("vnet32", "100.100.1.1/32", "9.1.0.1,9.1.0.2");
+        checkRouteAdvertised("100.100.1.0/24");
+
+        // Drop one primary -> route stays on the primary group with just 9.1.0.1.
+        updateBfdSessionState("9.1.0.2", SAI_BFD_SESSION_STATE_DOWN);
+        checkPriorityRoute("100.100.1.1", {"9.1.0.1"});
+        checkStateDbRoute("vnet32", "100.100.1.1/32", "9.1.0.1");
+        checkRouteAdvertised("100.100.1.0/24");
+
+        // Both primaries down -> fail over to the secondary (local) group.
+        updateBfdSessionState("9.1.0.1", SAI_BFD_SESSION_STATE_DOWN);
+        checkStateDbRoute("vnet32", "100.100.1.1/32", "9.1.0.3,9.1.0.4");
+        checkRouteAdvertised("100.100.1.0/24");
+
+        // Drop one secondary -> route stays on the secondary group with 9.1.0.4.
+        updateBfdSessionState("9.1.0.3", SAI_BFD_SESSION_STATE_DOWN);
+        checkStateDbRoute("vnet32", "100.100.1.1/32", "9.1.0.4");
+        checkRouteAdvertised("100.100.1.0/24");
+
+        // Last endpoint down -> route withdrawn entirely, summary unadvertised.
+        updateBfdSessionState("9.1.0.4", SAI_BFD_SESSION_STATE_DOWN);
+        EXPECT_EQ(findRoute("100.100.1.1"), nullptr);
+        checkStateDbRouteRemoved("vnet32", "100.100.1.1/32");
+        checkRouteNotAdvertised("100.100.1.0/24");
+
+        // Secondaries return -> route restored over the secondary group.
+        updateBfdSessionState("9.1.0.3", SAI_BFD_SESSION_STATE_UP);
+        updateBfdSessionState("9.1.0.4", SAI_BFD_SESSION_STATE_UP);
+        checkStateDbRoute("vnet32", "100.100.1.1/32", "9.1.0.3,9.1.0.4");
+        checkRouteAdvertised("100.100.1.0/24");
+
+        // A primary returns -> route switches back to the primary group.
+        updateBfdSessionState("9.1.0.1", SAI_BFD_SESSION_STATE_UP);
+        checkPriorityRoute("100.100.1.1", {"9.1.0.1"});
+        checkStateDbRoute("vnet32", "100.100.1.1/32", "9.1.0.1");
+        checkRouteAdvertised("100.100.1.0/24");
+
+        // Second primary returns -> both primaries in the group again.
+        updateBfdSessionState("9.1.0.2", SAI_BFD_SESSION_STATE_UP);
+        checkPriorityRoute("100.100.1.1", {"9.1.0.1", "9.1.0.2"});
+        checkStateDbRoute("vnet32", "100.100.1.1/32", "9.1.0.1,9.1.0.2");
+        checkRouteAdvertised("100.100.1.0/24");
+
+        // Secondary churn must not disturb an active-primary route.
+        updateBfdSessionState("9.1.0.3", SAI_BFD_SESSION_STATE_DOWN);
+        updateBfdSessionState("9.1.0.4", SAI_BFD_SESSION_STATE_DOWN);
+        checkPriorityRoute("100.100.1.1", {"9.1.0.1", "9.1.0.2"});
+        checkStateDbRoute("vnet32", "100.100.1.1/32", "9.1.0.1,9.1.0.2");
+        checkRouteAdvertised("100.100.1.0/24");
+
+        updateBfdSessionState("9.1.0.3", SAI_BFD_SESSION_STATE_UP);
+        updateBfdSessionState("9.1.0.4", SAI_BFD_SESSION_STATE_UP);
+        checkPriorityRoute("100.100.1.1", {"9.1.0.1", "9.1.0.2"});
+        checkStateDbRoute("vnet32", "100.100.1.1/32", "9.1.0.1,9.1.0.2");
+        checkRouteAdvertised("100.100.1.0/24");
+
+        // Delete: route withdrawn, summary unadvertised, all sessions removed.
+        delVnetRouteMonitored("vnet32", "100.100.1.1/32");
+        checkStateDbRouteRemoved("vnet32", "100.100.1.1/32");
+        checkRouteNotAdvertised("100.100.1.0/24");
+        EXPECT_FALSE(bfdSessionExists("9.1.0.1"));
+        EXPECT_FALSE(bfdSessionExists("9.1.0.2"));
+        EXPECT_FALSE(bfdSessionExists("9.1.0.3"));
+        EXPECT_FALSE(bfdSessionExists("9.1.0.4"));
+
+        delVnet("vnet32");
+        delVxlanTunnel("tunnel_32");
+    }
+
     // Mock equivalent of test_vnet_orch_34: a custom_bfd priority route whose
     // primary is a directly-connected local endpoint. The route is re-paired on
     // the fly (endpoint set + primary changed): the BFD session for the dropped
