@@ -2523,4 +2523,72 @@ namespace vnetorch_test
         delVnetRoute("Vnet22", "100.100.1.71/32");
         checkStateDbRouteRemoved("Vnet22", "100.100.1.71/32");
     }
+
+    // Changing a VNET's overlay_dmac on the fly -- the mock equivalent of
+    // test_vnet_orch_23. A VNET can be created, deleted and re-created
+    // repeatedly and its overlay_dmac updated; each custom-monitor APP_DB row a
+    // route creates carries the VNET's current overlay_dmac, and updating the
+    // dmac while routes exist rewrites every one of their monitor rows. An empty
+    // dmac update is ignored (the previous value is retained).
+    TEST_F(VNetOrchTest, VnetCustomMonitorOverlayDmacUpdate)
+    {
+        setVxlanTunnel("tunnel_22", "9.9.9.3");
+
+        // Create/delete/re-create the VNET a few times and update the dmac before
+        // any routes exist; the net current dmac is ...:77.
+        setVnet("Vnet22", "tunnel_22", "10022", "", /*advertise_prefix=*/true,
+                "22:33:33:44:44:66");
+        delVnet("Vnet22");
+        setVnet("Vnet22", "tunnel_22", "10022", "", true, "22:33:33:44:44:66");
+        setVnet("Vnet22", "tunnel_22", "10022", "", true, "22:33:33:44:44:77");
+        delVnet("Vnet22");
+        setVnet("Vnet22", "tunnel_22", "10022", "", true, "22:33:33:44:44:66");
+        setVnet("Vnet22", "tunnel_22", "10022", "", true, "22:33:33:44:44:77");
+
+        // Add a route; its monitor sessions carry the current dmac ...:77.
+        setVnetRoutePriority("Vnet22", "100.100.1.11/32", "19.0.0.1,19.0.0.2,19.0.0.3",
+                             "19.1.0.1,19.1.0.2,19.1.0.3", /*primary=*/"19.0.0.1",
+                             "custom", /*adv_prefix=*/"100.100.1.0/24", "test_prf");
+        for (const char *m : {"19.1.0.1", "19.1.0.2", "19.1.0.3"})
+            checkCustomMonitorAppDb("100.100.1.11/32", m, "vxlan", "22:33:33:44:44:77");
+
+        // Update the dmac to ...:88 while the route exists: every monitor row is
+        // rewritten with the new dmac.
+        setVnet("Vnet22", "tunnel_22", "10022", "", true, "22:33:33:44:44:88");
+        for (const char *m : {"19.1.0.1", "19.1.0.2", "19.1.0.3"})
+            checkCustomMonitorAppDb("100.100.1.11/32", m, "vxlan", "22:33:33:44:44:88");
+
+        // Bringing an endpoint up does not change the monitor rows' dmac.
+        updateMonitorSessionState("100.100.1.11/32", "19.1.0.1", "up");
+        for (const char *m : {"19.1.0.1", "19.1.0.2", "19.1.0.3"})
+            checkCustomMonitorAppDb("100.100.1.11/32", m, "vxlan", "22:33:33:44:44:88");
+
+        // An empty dmac update is a no-op: rows retain ...:88.
+        setVnet("Vnet22", "tunnel_22", "10022", "", true, "");
+        for (const char *m : {"19.1.0.1", "19.1.0.2", "19.1.0.3"})
+            checkCustomMonitorAppDb("100.100.1.11/32", m, "vxlan", "22:33:33:44:44:88");
+
+        // Remove the route: its monitor sessions are deleted.
+        delVnetRoute("Vnet22", "100.100.1.11/32");
+        checkStateDbRouteRemoved("Vnet22", "100.100.1.11/32");
+        for (const char *m : {"19.1.0.1", "19.1.0.2", "19.1.0.3"})
+            checkCustomMonitorDeleted("100.100.1.11/32", m);
+
+        // Bring the endpoint down, update the dmac to ...:66 and re-add the route;
+        // the fresh monitor rows carry ...:66 and the active route is advertised.
+        updateMonitorSessionState("100.100.1.11/32", "19.1.0.1", "down");
+        setVnet("Vnet22", "tunnel_22", "10022", "", true, "22:33:33:44:44:66");
+        setVnetRoutePriority("Vnet22", "100.100.1.11/32", "19.0.0.1,19.0.0.2,19.0.0.3",
+                             "19.1.0.1,19.1.0.2,19.1.0.3", /*primary=*/"19.0.0.1",
+                             "custom", /*adv_prefix=*/"100.100.1.0/24", "test_prf");
+        updateMonitorSessionState("100.100.1.11/32", "19.1.0.1", "up");
+        checkRouteAdvertised("100.100.1.0/24", "test_prf");
+        for (const char *m : {"19.1.0.1", "19.1.0.2", "19.1.0.3"})
+            checkCustomMonitorAppDb("100.100.1.11/32", m, "vxlan", "22:33:33:44:44:66");
+
+        delVnetRoute("Vnet22", "100.100.1.11/32");
+        checkStateDbRouteRemoved("Vnet22", "100.100.1.11/32");
+        for (const char *m : {"19.1.0.1", "19.1.0.2", "19.1.0.3"})
+            checkCustomMonitorDeleted("100.100.1.11/32", m);
+    }
 }
