@@ -1477,4 +1477,107 @@ namespace vnetorch_test
         for (const char *mon : {"fd:10:2::1", "fd:10:2::2", "fd:10:2::3", "fd:10:2::4"})
             EXPECT_FALSE(bfdSessionExists(mon)) << "BFD session " << mon << " not removed";
     }
+
+    // Re-applying an identical single-endpoint BFD-monitored route is
+    // idempotent -- the mock equivalent of test_vnet_orch_16. A monitored
+    // single-endpoint route programs one tunnel next hop while its BFD session
+    // is up; re-applying it (up, or while down then back up) neither leaks nor
+    // duplicates the next hop, and deleting it removes the next hop.
+    TEST_F(VNetOrchTest, VnetMonitoredSingleRouteReaddIsIdempotent)
+    {
+        setVxlanTunnel("tunnel_16", "fd:8::33");
+        setVnet("Vnet16", "tunnel_16", "10008", "");
+
+        auto activeNexthops = [&]() {
+            size_t c = 0;
+            for (const auto &nh : m_rt.nexthops)
+                if (find(m_rt.removedNexthops.begin(), m_rt.removedNexthops.end(),
+                         nh.oid) == m_rt.removedNexthops.end())
+                    c++;
+            return c;
+        };
+
+        setVnetRouteMonitored("Vnet16", "fd:8:11::32/128", "fd:8:2::1", "fd:8:2::1");
+        updateBfdSessionState("fd:8:2::1", SAI_BFD_SESSION_STATE_UP);
+        const RouteCaptures::Route *r = findRoute("fd:8:11::32");
+        ASSERT_NE(r, nullptr);
+        EXPECT_EQ(activeNexthops(), 1U);
+        EXPECT_TRUE(m_rt.groups.empty());
+        checkStateDbRoute("Vnet16", "fd:8:11::32/128", "fd:8:2::1");
+        checkRouteNotAdvertised("fd:8:11::32/128");
+
+        // Re-apply the identical route while up: still exactly one next hop.
+        setVnetRouteMonitored("Vnet16", "fd:8:11::32/128", "fd:8:2::1", "fd:8:2::1");
+        EXPECT_EQ(activeNexthops(), 1U);
+        EXPECT_TRUE(m_rt.groups.empty());
+        checkStateDbRoute("Vnet16", "fd:8:11::32/128", "fd:8:2::1");
+
+        // Session down: route deprogrammed. Re-apply while down, then bring it
+        // back up: the route is programmed again and STATE_DB reports it active.
+        updateBfdSessionState("fd:8:2::1", SAI_BFD_SESSION_STATE_DOWN);
+        checkStateDbRoute("Vnet16", "fd:8:11::32/128", "");
+        setVnetRouteMonitored("Vnet16", "fd:8:11::32/128", "fd:8:2::1", "fd:8:2::1");
+        updateBfdSessionState("fd:8:2::1", SAI_BFD_SESSION_STATE_UP);
+        checkStateDbRoute("Vnet16", "fd:8:11::32/128", "fd:8:2::1");
+        checkRouteNotAdvertised("fd:8:11::32/128");
+
+        // Deleting the route removes the tunnel next hop and its STATE_DB entry,
+        // and the BFD session for its monitor.
+        delVnetRouteMonitored("Vnet16", "fd:8:11::32/128");
+        EXPECT_EQ(activeNexthops(), 0U);
+        checkStateDbRouteRemoved("Vnet16", "fd:8:11::32/128");
+        EXPECT_FALSE(bfdSessionExists("fd:8:2::1"));
+    }
+
+    // Re-applying an identical multi-endpoint BFD-monitored route is idempotent
+    // -- the mock equivalent of test_vnet_orch_17. Re-applying while all
+    // monitors are down keeps the route unprogrammed; re-applying while up
+    // reuses the same next hop group (no new group, none removed); deleting
+    // removes the group and all its BFD sessions.
+    TEST_F(VNetOrchTest, VnetMonitoredEcmpRouteReaddIsIdempotent)
+    {
+        setVxlanTunnel("tunnel_17", "9.9.9.9");
+        setVnet("Vnet17", "tunnel_17", "10017", "");
+
+        setVnetRouteMonitored("Vnet17", "100.100.1.1/32",
+                              "9.0.0.1,9.0.0.2,9.0.0.3", "9.1.0.1,9.1.0.2,9.1.0.3");
+        // All monitors down: not programmed. Re-apply -- still not programmed.
+        EXPECT_EQ(findRoute("100.100.1.1"), nullptr);
+        checkStateDbRoute("Vnet17", "100.100.1.1/32", "");
+        setVnetRouteMonitored("Vnet17", "100.100.1.1/32",
+                              "9.0.0.1,9.0.0.2,9.0.0.3", "9.1.0.1,9.1.0.2,9.1.0.3");
+        EXPECT_EQ(findRoute("100.100.1.1"), nullptr);
+        checkStateDbRoute("Vnet17", "100.100.1.1/32", "");
+
+        // All up: one group with three members.
+        updateBfdSessionState("9.1.0.1", SAI_BFD_SESSION_STATE_UP);
+        updateBfdSessionState("9.1.0.2", SAI_BFD_SESSION_STATE_UP);
+        updateBfdSessionState("9.1.0.3", SAI_BFD_SESSION_STATE_UP);
+        const RouteCaptures::Route *r = findRoute("100.100.1.1");
+        ASSERT_NE(r, nullptr);
+        const sai_object_id_t nhg = r->next_hop_id;
+        EXPECT_EQ(activeMembers(nhg), 3U);
+        const size_t groupsAfterUp = m_rt.groups.size();
+        checkStateDbRoute("Vnet17", "100.100.1.1/32", "9.0.0.1,9.0.0.2,9.0.0.3");
+
+        // Re-apply the identical active route: same group, no new group, none
+        // removed.
+        setVnetRouteMonitored("Vnet17", "100.100.1.1/32",
+                              "9.0.0.1,9.0.0.2,9.0.0.3", "9.1.0.1,9.1.0.2,9.1.0.3");
+        r = findRoute("100.100.1.1");
+        ASSERT_NE(r, nullptr);
+        EXPECT_EQ(r->next_hop_id, nhg);
+        EXPECT_EQ(m_rt.groups.size(), groupsAfterUp);
+        EXPECT_TRUE(m_rt.removedGroups.empty());
+        EXPECT_EQ(activeMembers(nhg), 3U);
+        checkStateDbRoute("Vnet17", "100.100.1.1/32", "9.0.0.1,9.0.0.2,9.0.0.3");
+
+        // Deleting removes the group, its STATE_DB entry and all BFD sessions.
+        delVnetRouteMonitored("Vnet17", "100.100.1.1/32");
+        EXPECT_NE(find(m_rt.removedGroups.begin(), m_rt.removedGroups.end(), nhg),
+                  m_rt.removedGroups.end());
+        checkStateDbRouteRemoved("Vnet17", "100.100.1.1/32");
+        for (const char *mon : {"9.1.0.1", "9.1.0.2", "9.1.0.3"})
+            EXPECT_FALSE(bfdSessionExists(mon)) << "BFD session " << mon << " not removed";
+    }
 }
