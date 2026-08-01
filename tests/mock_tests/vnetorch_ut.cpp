@@ -3390,6 +3390,73 @@ namespace vnetorch_test
         checkVnetLocalRouteRemoved("10.10.0.0/24");
     }
 
+    // Mock equivalent of test_vnet_orch_local_endpoint_alias_resolution: a
+    // custom-monitored, check_directly_connected route whose endpoints become
+    // directly-connected local endpoints. The routes are added BEFORE the
+    // neighbors exist, so the cached NextHopKey must resolve the local interface
+    // when the monitor later goes up -- the endpoint then resolves to the
+    // neighbor's SAI_NEXT_HOP_TYPE_IP next hop (gNeighOrch), not a tunnel-encap
+    // next hop. A single active local endpoint points the route directly at that
+    // IP next hop; two active local endpoints form an (unordered) ECMP group of
+    // IP next hops.
+    TEST_F(VNetOrchTest, VnetLocalEndpointAliasResolution)
+    {
+        const string endpoint = "20.20.20.5";
+        const string backup_endpoint = "20.20.20.6";
+        const string ecmp_endpoint = "20.20.20.7";
+        const string route_prefix = "103.100.1.1/32";
+        const string ecmp_route_prefix = "103.100.1.2/32";
+
+        // Local router interface Ethernet0 owns the 20.20.20.0/24 subnet, so the
+        // endpoints below are directly connected once their neighbors resolve.
+        createL3Interface("Ethernet0", "20.20.20.1/24");
+
+        setVxlanTunnel("tunnel_local_ep", "9.9.9.9");
+        setVnet("Vnet_local_ep", "tunnel_local_ep", "1001", "");
+
+        // Add the routes before the neighbors exist: the endpoint's NextHopKey is
+        // cached unresolved and must be resolved against the local interface when
+        // the monitor later goes up.
+        setVnetRoutePriority("Vnet_local_ep", route_prefix,
+                             endpoint + "," + backup_endpoint,
+                             endpoint + "," + backup_endpoint,
+                             /*primary=*/endpoint, /*monitoring=*/"custom",
+                             /*adv_prefix=*/"", /*profile=*/"",
+                             /*check_directly_connected=*/true);
+        setVnetRoutePriority("Vnet_local_ep", ecmp_route_prefix,
+                             endpoint + "," + ecmp_endpoint,
+                             endpoint + "," + ecmp_endpoint,
+                             /*primary=*/endpoint + "," + ecmp_endpoint,
+                             /*monitoring=*/"custom", /*adv_prefix=*/"",
+                             /*profile=*/"", /*check_directly_connected=*/true);
+
+        // Resolve the neighbors -> gNeighOrch creates an IP (directly-connected)
+        // next hop for each local endpoint.
+        addNeighbor("Ethernet0", endpoint, "00:01:02:03:04:05");
+        addNeighbor("Ethernet0", ecmp_endpoint, "00:01:02:03:04:07");
+        checkEndpointIsLocal(endpoint);
+        checkEndpointIsLocal(ecmp_endpoint);
+
+        // Bring the monitored endpoints up.
+        updateMonitorSessionState(route_prefix, endpoint, "up");
+        updateMonitorSessionState(ecmp_route_prefix, endpoint, "up");
+        updateMonitorSessionState(ecmp_route_prefix, ecmp_endpoint, "up");
+
+        // The single-endpoint route points directly at the local endpoint's IP
+        // next hop; the ECMP route forms a group of both local IP next hops.
+        checkVnetLocalRoute(route_prefix, {endpoint});
+        checkVnetLocalRoute(ecmp_route_prefix, {endpoint, ecmp_endpoint});
+
+        // Deleting the routes withdraws them and tears down the monitor sessions.
+        delVnetRoute("Vnet_local_ep", ecmp_route_prefix);
+        delVnetRoute("Vnet_local_ep", route_prefix);
+        checkVnetLocalRouteRemoved(route_prefix);
+        checkVnetLocalRouteRemoved(ecmp_route_prefix);
+
+        delVnet("Vnet_local_ep");
+        delVxlanTunnel("tunnel_local_ep");
+    }
+
     // BFD-monitored ECMP VNET route through a Traffic-Shift-Away cycle -- the
     // mock equivalent of test_vnet_orch_25. TSA (BGP_DEVICE_GLOBAL|STATE
     // tsa_enabled) drives BfdOrch::handleTsaStateChange, which tears down every
