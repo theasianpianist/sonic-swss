@@ -750,6 +750,12 @@ namespace vnetorch_test
                 m_vnetRouteOrch->getExecutor(APP_VNET_RT_TUNNEL_TABLE_NAME));
             consumer->addToSync({{vnet + ":" + prefix, DEL_COMMAND, {}}});
             static_cast<Orch *>(m_vnetRouteOrch.get())->doTask(*consumer);
+            // Keep the mock DB in sync: the Consumer push above drives the delete
+            // handler, but the row must also leave the backing table so a later
+            // addExistingData() (e.g. from setVnetRoute*) does not re-enqueue this
+            // deleted route as a SET and resurrect it.
+            Table tbl(m_app_db.get(), APP_VNET_RT_TUNNEL_TABLE_NAME);
+            tbl.del(vnet + ":" + prefix);
         }
 
         // A BFD-monitored VNET route: the VS test writes VNET_ROUTE_TUNNEL with
@@ -794,13 +800,15 @@ namespace vnetorch_test
                                   const string &endpoints, const string &monitors,
                                   const string &primary,
                                   const string &monitoring = "custom",
-                                  const string &adv_prefix = "")
+                                  const string &adv_prefix = "",
+                                  const string &profile = "")
         {
             vector<FieldValueTuple> fvs = {{"endpoint", endpoints},
                                            {"endpoint_monitor", monitors},
                                            {"primary", primary},
                                            {"monitoring", monitoring}};
             if (!adv_prefix.empty()) fvs.push_back({"adv_prefix", adv_prefix});
+            if (!profile.empty()) fvs.push_back({"profile", profile});
             Table tbl(m_app_db.get(), APP_VNET_RT_TUNNEL_TABLE_NAME);
             tbl.set(vnet + ":" + prefix, fvs);
             m_vnetRouteOrch->addExistingData(&tbl);
@@ -2142,5 +2150,377 @@ namespace vnetorch_test
         checkRouteNotAdvertised("100.100.1.0/24");
         for (const char *m : {"9.1.0.1", "9.1.0.2", "9.1.0.3", "9.1.0.4"})
             checkCustomMonitorDeleted("100.100.1.1/32", m);
+    }
+
+    // Two overlapping priority routes with different primary subsets over the
+    // same four endpoints -- the mock equivalent of test_vnet_orch_19. route1's
+    // primary is {1,2} (advertised with a profile), route2's is {3,4}
+    // (advertised without one) under a separate adv_prefix. Each route's monitors
+    // are independent (keyed monitor|prefix), so the same endpoint IP can be up
+    // for one route and down for the other. The two routes converge on the same
+    // active set as endpoints flap, exercising primary-preference, secondary
+    // fallback and per-route advertisement.
+    TEST_F(VNetOrchTest, VnetTwoPriorityRoutesOverlappingGroups)
+    {
+        setVxlanTunnel("tunnel_19", "9.9.9.19");
+        setVnet("Vnet19", "tunnel_19", "10019", "", /*advertise_prefix=*/true,
+                "22:33:33:44:44:66");
+
+        setVnetRoutePriority("Vnet19", "100.100.1.1/32",
+                             "9.1.0.1,9.1.0.2,9.1.0.3,9.1.0.4",
+                             "9.1.0.1,9.1.0.2,9.1.0.3,9.1.0.4",
+                             /*primary=*/"9.1.0.1,9.1.0.2", "custom",
+                             /*adv_prefix=*/"100.100.1.0/24", /*profile=*/"Test_profile");
+        setVnetRoutePriority("Vnet19", "200.100.1.1/32",
+                             "9.1.0.1,9.1.0.2,9.1.0.3,9.1.0.4",
+                             "9.1.0.1,9.1.0.2,9.1.0.3,9.1.0.4",
+                             /*primary=*/"9.1.0.3,9.1.0.4", "custom",
+                             /*adv_prefix=*/"200.100.1.0/24");
+
+        // All monitors down: neither route programmed, neither prefix advertised.
+        EXPECT_EQ(findRoute("100.100.1.1"), nullptr);
+        checkStateDbRoute("Vnet19", "100.100.1.1/32", "");
+        checkRouteNotAdvertised("100.100.1.0/24");
+        EXPECT_EQ(findRoute("200.100.1.1"), nullptr);
+        checkStateDbRoute("Vnet19", "200.100.1.1/32", "");
+        checkRouteNotAdvertised("200.100.1.0/24");
+
+        // route1 endpoint 1 up: route1 on its primary {1}.
+        updateMonitorSessionState("100.100.1.1/32", "9.1.0.1", "up");
+        checkPriorityRoute("100.100.1.1", {"9.1.0.1"});
+        checkStateDbRoute("Vnet19", "100.100.1.1/32", "9.1.0.1");
+        checkRouteAdvertised("100.100.1.0/24", "Test_profile");
+
+        // route2 endpoint 1 up: 1 is secondary for route2, its primary {3,4} is
+        // still down, so route2 falls back to {1}.
+        updateMonitorSessionState("200.100.1.1/32", "9.1.0.1", "up");
+        checkPriorityRoute("200.100.1.1", {"9.1.0.1"});
+        checkStateDbRoute("Vnet19", "200.100.1.1/32", "9.1.0.1");
+        checkRouteAdvertised("200.100.1.0/24");
+
+        // route1 endpoint 2 up: primary {1,2}.
+        updateMonitorSessionState("100.100.1.1/32", "9.1.0.2", "up");
+        checkPriorityRoute("100.100.1.1", {"9.1.0.1", "9.1.0.2"});
+        checkStateDbRoute("Vnet19", "100.100.1.1/32", "9.1.0.1,9.1.0.2");
+        checkRouteAdvertised("100.100.1.0/24", "Test_profile");
+
+        // route2 endpoint 2 up: primary {3,4} still down, secondary {1,2}.
+        updateMonitorSessionState("200.100.1.1/32", "9.1.0.2", "up");
+        checkPriorityRoute("200.100.1.1", {"9.1.0.1", "9.1.0.2"});
+        checkStateDbRoute("Vnet19", "200.100.1.1/32", "9.1.0.1,9.1.0.2");
+        checkRouteAdvertised("200.100.1.0/24");
+
+        // endpoint 3 up for both: route1 unaffected (primary {1,2}); route2's
+        // primary {3,4} now has 3 up, so it switches to {3}.
+        updateMonitorSessionState("100.100.1.1/32", "9.1.0.3", "up");
+        updateMonitorSessionState("200.100.1.1/32", "9.1.0.3", "up");
+        checkPriorityRoute("100.100.1.1", {"9.1.0.1", "9.1.0.2"});
+        checkStateDbRoute("Vnet19", "100.100.1.1/32", "9.1.0.1,9.1.0.2");
+        checkRouteAdvertised("100.100.1.0/24", "Test_profile");
+        checkPriorityRoute("200.100.1.1", {"9.1.0.3"});
+        checkStateDbRoute("Vnet19", "200.100.1.1/32", "9.1.0.3");
+        checkRouteAdvertised("200.100.1.0/24");
+
+        // endpoint 4 up for both: route1 still {1,2}; route2 primary {3,4}.
+        updateMonitorSessionState("100.100.1.1/32", "9.1.0.4", "up");
+        updateMonitorSessionState("200.100.1.1/32", "9.1.0.4", "up");
+        checkPriorityRoute("100.100.1.1", {"9.1.0.1", "9.1.0.2"});
+        checkStateDbRoute("Vnet19", "100.100.1.1/32", "9.1.0.1,9.1.0.2");
+        checkPriorityRoute("200.100.1.1", {"9.1.0.3", "9.1.0.4"});
+        checkStateDbRoute("Vnet19", "200.100.1.1/32", "9.1.0.3,9.1.0.4");
+
+        // endpoint 1 down for both: route1 primary drops to {2}; route2 keeps
+        // its primary {3,4}.
+        updateMonitorSessionState("100.100.1.1/32", "9.1.0.1", "down");
+        updateMonitorSessionState("200.100.1.1/32", "9.1.0.1", "down");
+        checkPriorityRoute("100.100.1.1", {"9.1.0.2"});
+        checkStateDbRoute("Vnet19", "100.100.1.1/32", "9.1.0.2");
+        checkPriorityRoute("200.100.1.1", {"9.1.0.3", "9.1.0.4"});
+        checkStateDbRoute("Vnet19", "200.100.1.1/32", "9.1.0.3,9.1.0.4");
+
+        // endpoint 2 down for both: route1 primary all down -> secondary {3,4};
+        // route2 unaffected.
+        updateMonitorSessionState("100.100.1.1/32", "9.1.0.2", "down");
+        updateMonitorSessionState("200.100.1.1/32", "9.1.0.2", "down");
+        checkPriorityRoute("100.100.1.1", {"9.1.0.3", "9.1.0.4"});
+        checkStateDbRoute("Vnet19", "100.100.1.1/32", "9.1.0.3,9.1.0.4");
+        checkPriorityRoute("200.100.1.1", {"9.1.0.3", "9.1.0.4"});
+        checkStateDbRoute("Vnet19", "200.100.1.1/32", "9.1.0.3,9.1.0.4");
+
+        // endpoint 3 down for both: route1 secondary drops to {4}; route2 primary
+        // drops to {4}.
+        updateMonitorSessionState("100.100.1.1/32", "9.1.0.3", "down");
+        updateMonitorSessionState("200.100.1.1/32", "9.1.0.3", "down");
+        checkPriorityRoute("100.100.1.1", {"9.1.0.4"});
+        checkStateDbRoute("Vnet19", "100.100.1.1/32", "9.1.0.4");
+        checkPriorityRoute("200.100.1.1", {"9.1.0.4"});
+        checkStateDbRoute("Vnet19", "200.100.1.1/32", "9.1.0.4");
+
+        // endpoint 4 down for both: every endpoint down, both routes withdrawn.
+        updateMonitorSessionState("100.100.1.1/32", "9.1.0.4", "down");
+        updateMonitorSessionState("200.100.1.1/32", "9.1.0.4", "down");
+        EXPECT_EQ(findRoute("100.100.1.1"), nullptr);
+        checkStateDbRouteRemoved("Vnet19", "100.100.1.1/32");
+        checkRouteNotAdvertised("100.100.1.0/24");
+        EXPECT_EQ(findRoute("200.100.1.1"), nullptr);
+        checkStateDbRouteRemoved("Vnet19", "200.100.1.1/32");
+        checkRouteNotAdvertised("200.100.1.0/24");
+
+        // Delete both routes; every monitor session is removed.
+        delVnetRoute("Vnet19", "100.100.1.1/32");
+        delVnetRoute("Vnet19", "200.100.1.1/32");
+        for (const char *p : {"100.100.1.1/32", "200.100.1.1/32"})
+            for (const char *m : {"9.1.0.1", "9.1.0.2", "9.1.0.3", "9.1.0.4"})
+                checkCustomMonitorDeleted(p, m);
+    }
+
+    // Single-endpoint priority route primary/secondary switchover -- the mock
+    // equivalent of test_vnet_orch_20. Two endpoints, primary {1}, secondary
+    // {2}; each transition programs the route to point directly at exactly one
+    // endpoint's tunnel next hop (never a group), preferring the primary while
+    // it is up and falling back to the secondary otherwise.
+    TEST_F(VNetOrchTest, VnetSingleEndpointPriorityRouteSwitchover)
+    {
+        setVxlanTunnel("tunnel_20", "9.9.9.9");
+        setVnet("Vnet20", "tunnel_20", "10020", "", /*advertise_prefix=*/true,
+                "22:33:33:44:44:66");
+
+        setVnetRoutePriority("Vnet20", "100.100.1.1/32", "9.1.0.1,9.1.0.2",
+                             "9.1.0.1,9.1.0.2", /*primary=*/"9.1.0.1", "custom",
+                             /*adv_prefix=*/"100.100.1.0/24", /*profile=*/"Test_profile");
+
+        // Both up: primary {1} preferred.
+        updateMonitorSessionState("100.100.1.1/32", "9.1.0.1", "up");
+        updateMonitorSessionState("100.100.1.1/32", "9.1.0.2", "up");
+        checkPriorityRoute("100.100.1.1", {"9.1.0.1"});
+        checkStateDbRoute("Vnet20", "100.100.1.1/32", "9.1.0.1");
+        checkRouteAdvertised("100.100.1.0/24", "Test_profile");
+
+        // Secondary down: primary still up, route unchanged on {1}.
+        updateMonitorSessionState("100.100.1.1/32", "9.1.0.2", "down");
+        checkPriorityRoute("100.100.1.1", {"9.1.0.1"});
+        checkStateDbRoute("Vnet20", "100.100.1.1/32", "9.1.0.1");
+        checkRouteAdvertised("100.100.1.0/24", "Test_profile");
+
+        // Primary down, secondary up: fall back to {2}.
+        updateMonitorSessionState("100.100.1.1/32", "9.1.0.1", "down");
+        updateMonitorSessionState("100.100.1.1/32", "9.1.0.2", "up");
+        checkPriorityRoute("100.100.1.1", {"9.1.0.2"});
+        checkStateDbRoute("Vnet20", "100.100.1.1/32", "9.1.0.2");
+        checkRouteAdvertised("100.100.1.0/24", "Test_profile");
+
+        // Primary back up: switch back to {1}.
+        updateMonitorSessionState("100.100.1.1/32", "9.1.0.1", "up");
+        checkPriorityRoute("100.100.1.1", {"9.1.0.1"});
+        checkStateDbRoute("Vnet20", "100.100.1.1/32", "9.1.0.1");
+        checkRouteAdvertised("100.100.1.0/24", "Test_profile");
+
+        // Both down: route withdrawn.
+        updateMonitorSessionState("100.100.1.1/32", "9.1.0.1", "down");
+        updateMonitorSessionState("100.100.1.1/32", "9.1.0.2", "down");
+        EXPECT_EQ(findRoute("100.100.1.1"), nullptr);
+        checkStateDbRouteRemoved("Vnet20", "100.100.1.1/32");
+
+        // Delete the route; monitor sessions removed.
+        delVnetRoute("Vnet20", "100.100.1.1/32");
+        checkStateDbRouteRemoved("Vnet20", "100.100.1.1/32");
+        checkRouteNotAdvertised("100.100.1.0/24");
+        checkCustomMonitorDeleted("100.100.1.1/32", "9.1.0.1");
+        checkCustomMonitorDeleted("100.100.1.1/32", "9.1.0.2");
+    }
+
+    // Multiple IPv6 priority routes sharing one adv_prefix -- the mock
+    // equivalent of test_vnet_orch_21. Three routes all advertise the same
+    // summary prefix fd:10:10::/64; the advertisement is reference-counted, so it
+    // stays up while any contributing route is active and is withdrawn only once
+    // the last one is deleted. Also exercises adding a route after another with
+    // the shared prefix is already advertised.
+    TEST_F(VNetOrchTest, VnetPriorityRoutesSharedAdvPrefixRefcount)
+    {
+        setVxlanTunnel("tunnel_21", "fd:10::32");
+        setVnet("Vnet21", "tunnel_21", "10021", "", /*advertise_prefix=*/true,
+                "22:33:33:44:44:66");
+
+        // Route 1 over fd:10:1::1-4, primary {1,2}; bring its primary up.
+        setVnetRoutePriority("Vnet21", "fd:10:10::1/128",
+                             "fd:10:1::1,fd:10:1::2,fd:10:1::3,fd:10:1::4",
+                             "fd:10:2::1,fd:10:2::2,fd:10:2::3,fd:10:2::4",
+                             /*primary=*/"fd:10:1::3,fd:10:1::4", "custom",
+                             /*adv_prefix=*/"fd:10:10::/64", /*profile=*/"test_prf");
+        // Only the two secondary monitors up -> route on the secondary {1,2}.
+        updateMonitorSessionState("fd:10:10::1/128", "fd:10:2::1", "up");
+        updateMonitorSessionState("fd:10:10::1/128", "fd:10:2::2", "up");
+        checkPriorityRoute("fd:10:10::1", {"fd:10:1::1", "fd:10:1::2"});
+        checkStateDbRoute("Vnet21", "fd:10:10::1/128", "fd:10:1::1,fd:10:1::2");
+        checkRouteAdvertised("fd:10:10::/64", "test_prf");
+
+        // Route 2 over a different endpoint block, primary {1,2}; all up.
+        setVnetRoutePriority("Vnet21", "fd:10:10::21/128",
+                             "fd:11:1::1,fd:11:1::2,fd:11:1::3,fd:11:1::4",
+                             "fd:11:2::1,fd:11:2::2,fd:11:2::3,fd:11:2::4",
+                             /*primary=*/"fd:11:1::1,fd:11:1::2", "custom",
+                             /*adv_prefix=*/"fd:10:10::/64", /*profile=*/"test_prf");
+        for (const char *m : {"fd:11:2::1", "fd:11:2::2", "fd:11:2::3", "fd:11:2::4"})
+            updateMonitorSessionState("fd:10:10::21/128", m, "up");
+        checkPriorityRoute("fd:10:10::21", {"fd:11:1::1", "fd:11:1::2"});
+        checkStateDbRoute("Vnet21", "fd:10:10::21/128", "fd:11:1::1,fd:11:1::2");
+        checkRouteAdvertised("fd:10:10::/64", "test_prf");
+
+        // Delete route 1: the shared advertisement stays (route 2 still active).
+        delVnetRoute("Vnet21", "fd:10:10::1/128");
+        checkStateDbRouteRemoved("Vnet21", "fd:10:10::1/128");
+        checkRouteAdvertised("fd:10:10::/64");
+
+        // Route 3 with the same shared prefix; primary {1,2} up.
+        setVnetRoutePriority("Vnet21", "fd:10:10::31/128",
+                             "fd:11:1::1,fd:11:1::2,fd:11:1::3,fd:11:1::4",
+                             "fd:11:2::1,fd:11:2::2,fd:11:2::3,fd:11:2::4",
+                             /*primary=*/"fd:11:1::1,fd:11:1::2", "custom",
+                             /*adv_prefix=*/"fd:10:10::/64", /*profile=*/"test_prf");
+        updateMonitorSessionState("fd:10:10::31/128", "fd:11:2::1", "up");
+        updateMonitorSessionState("fd:10:10::31/128", "fd:11:2::2", "up");
+        checkPriorityRoute("fd:10:10::31", {"fd:11:1::1", "fd:11:1::2"});
+        checkStateDbRoute("Vnet21", "fd:10:10::31/128", "fd:11:1::1,fd:11:1::2");
+        checkRouteAdvertised("fd:10:10::/64", "test_prf");
+
+        // Delete route 2: advertisement still up (route 3 remains).
+        delVnetRoute("Vnet21", "fd:10:10::21/128");
+        checkStateDbRouteRemoved("Vnet21", "fd:10:10::21/128");
+        checkRouteAdvertised("fd:10:10::/64");
+
+        // Delete route 3: last contributor gone, advertisement withdrawn.
+        delVnetRoute("Vnet21", "fd:10:10::31/128");
+        checkStateDbRouteRemoved("Vnet21", "fd:10:10::31/128");
+        checkRouteNotAdvertised("fd:10:10::/64");
+    }
+
+    // Priority route re-add + primary/secondary swap by update -- the mock
+    // equivalent of test_vnet_orch_22. Re-applying an identical priority route is
+    // a no-op; updating only the primary set to endpoints that are currently down
+    // leaves the route on its still-active endpoints (the roles swap, the active
+    // set does not); a full endpoint-set change moves the route to the new
+    // endpoints; and a route with no secondary endpoints is monitored without any
+    // SAI BFD session (custom monitoring never creates one).
+    TEST_F(VNetOrchTest, VnetPriorityRouteReaddAndPrimarySwap)
+    {
+        setVxlanTunnel("tunnel_22", "9.9.9.3");
+        setVnet("Vnet22", "tunnel_22", "10022", "", /*advertise_prefix=*/true,
+                "22:33:33:44:44:66");
+
+        // Single-primary route; bring the primary up.
+        setVnetRoutePriority("Vnet22", "100.100.1.11/32", "19.0.0.1,19.0.0.2,19.0.0.3",
+                             "19.1.0.1,19.1.0.2,19.1.0.3", /*primary=*/"19.0.0.1",
+                             "custom", /*adv_prefix=*/"100.100.1.0/24", "test_prf");
+        updateMonitorSessionState("100.100.1.11/32", "19.1.0.1", "up");
+        checkPriorityRoute("100.100.1.11", {"19.0.0.1"});
+        checkStateDbRoute("Vnet22", "100.100.1.11/32", "19.0.0.1");
+        checkRouteAdvertised("100.100.1.0/24", "test_prf");
+
+        // Re-apply the identical route: still on {19.0.0.1}, still advertised.
+        setVnetRoutePriority("Vnet22", "100.100.1.11/32", "19.0.0.1,19.0.0.2,19.0.0.3",
+                             "19.1.0.1,19.1.0.2,19.1.0.3", /*primary=*/"19.0.0.1",
+                             "custom", /*adv_prefix=*/"100.100.1.0/24", "test_prf");
+        checkPriorityRoute("100.100.1.11", {"19.0.0.1"});
+        checkStateDbRoute("Vnet22", "100.100.1.11/32", "19.0.0.1");
+        checkRouteAdvertised("100.100.1.0/24", "test_prf");
+
+        // Delete: advertisement withdrawn.
+        delVnetRoute("Vnet22", "100.100.1.11/32");
+        checkStateDbRouteRemoved("Vnet22", "100.100.1.11/32");
+        checkRouteNotAdvertised("100.100.1.0/24");
+
+        // ECMP route, primary {1,2} up.
+        setVnetRoutePriority("Vnet22", "100.100.1.57/32",
+                             "5.0.0.1,5.0.0.2,5.0.0.3,5.0.0.4",
+                             "5.1.0.1,5.1.0.2,5.1.0.3,5.1.0.4",
+                             /*primary=*/"5.0.0.1,5.0.0.2", "custom",
+                             /*adv_prefix=*/"100.100.1.0/24", "test_prf");
+        updateMonitorSessionState("100.100.1.57/32", "5.1.0.1", "up");
+        updateMonitorSessionState("100.100.1.57/32", "5.1.0.2", "up");
+        checkPriorityRoute("100.100.1.57", {"5.0.0.1", "5.0.0.2"});
+        checkStateDbRoute("Vnet22", "100.100.1.57/32", "5.0.0.1,5.0.0.2");
+
+        // Swap primary to {3,4} (currently down): the route stays on {1,2} (now
+        // acting as the active secondary).
+        setVnetRoutePriority("Vnet22", "100.100.1.57/32",
+                             "5.0.0.1,5.0.0.2,5.0.0.3,5.0.0.4",
+                             "5.1.0.1,5.1.0.2,5.1.0.3,5.1.0.4",
+                             /*primary=*/"5.0.0.3,5.0.0.4", "custom",
+                             /*adv_prefix=*/"100.100.1.0/24", "test_prf");
+        checkPriorityRoute("100.100.1.57", {"5.0.0.1", "5.0.0.2"});
+        checkStateDbRoute("Vnet22", "100.100.1.57/32", "5.0.0.1,5.0.0.2");
+        checkRouteAdvertised("100.100.1.0/24", "test_prf");
+        delVnetRoute("Vnet22", "100.100.1.57/32");
+        checkStateDbRouteRemoved("Vnet22", "100.100.1.57/32");
+        checkRouteNotAdvertised("100.100.1.0/24");
+
+        // Route whose endpoint set is fully replaced by a new block.
+        setVnetRoutePriority("Vnet22", "100.100.1.67/32",
+                             "5.0.0.1,5.0.0.2,5.0.0.3,5.0.0.4",
+                             "5.1.0.1,5.1.0.2,5.1.0.3,5.1.0.4",
+                             /*primary=*/"5.0.0.1,5.0.0.2", "custom",
+                             /*adv_prefix=*/"100.100.1.0/24", "test_prf");
+        updateMonitorSessionState("100.100.1.67/32", "5.1.0.1", "up");
+        updateMonitorSessionState("100.100.1.67/32", "5.1.0.2", "up");
+        checkPriorityRoute("100.100.1.67", {"5.0.0.1", "5.0.0.2"});
+        checkStateDbRoute("Vnet22", "100.100.1.67/32", "5.0.0.1,5.0.0.2");
+
+        // Swap primary to {3,4} (down): stays on the active {1,2}.
+        setVnetRoutePriority("Vnet22", "100.100.1.67/32",
+                             "5.0.0.1,5.0.0.2,5.0.0.3,5.0.0.4",
+                             "5.1.0.1,5.1.0.2,5.1.0.3,5.1.0.4",
+                             /*primary=*/"5.0.0.3,5.0.0.4", "custom",
+                             /*adv_prefix=*/"100.100.1.0/24", "test_prf");
+        checkPriorityRoute("100.100.1.67", {"5.0.0.1", "5.0.0.2"});
+        checkStateDbRoute("Vnet22", "100.100.1.67/32", "5.0.0.1,5.0.0.2");
+        checkRouteAdvertised("100.100.1.0/24", "test_prf");
+
+        // Replace endpoints with 5.0.0.5-8, primary {5,6} up.
+        setVnetRoutePriority("Vnet22", "100.100.1.67/32",
+                             "5.0.0.5,5.0.0.6,5.0.0.7,5.0.0.8",
+                             "5.1.0.5,5.1.0.6,5.1.0.7,5.1.0.8",
+                             /*primary=*/"5.0.0.5,5.0.0.6", "custom",
+                             /*adv_prefix=*/"100.100.1.0/24", "test_prf");
+        updateMonitorSessionState("100.100.1.67/32", "5.1.0.5", "up");
+        updateMonitorSessionState("100.100.1.67/32", "5.1.0.6", "up");
+        checkPriorityRoute("100.100.1.67", {"5.0.0.5", "5.0.0.6"});
+        checkStateDbRoute("Vnet22", "100.100.1.67/32", "5.0.0.5,5.0.0.6");
+        checkRouteAdvertised("100.100.1.0/24", "test_prf");
+
+        // Bring up 7,8 then swap primary to {7,8}: route follows to {7,8}.
+        updateMonitorSessionState("100.100.1.67/32", "5.1.0.7", "up");
+        updateMonitorSessionState("100.100.1.67/32", "5.1.0.8", "up");
+        setVnetRoutePriority("Vnet22", "100.100.1.67/32",
+                             "5.0.0.5,5.0.0.6,5.0.0.7,5.0.0.8",
+                             "5.1.0.5,5.1.0.6,5.1.0.7,5.1.0.8",
+                             /*primary=*/"5.0.0.7,5.0.0.8", "custom",
+                             /*adv_prefix=*/"100.100.1.0/24", "test_prf");
+        checkPriorityRoute("100.100.1.67", {"5.0.0.7", "5.0.0.8"});
+        checkStateDbRoute("Vnet22", "100.100.1.67/32", "5.0.0.7,5.0.0.8");
+        checkRouteAdvertised("100.100.1.0/24", "test_prf");
+        delVnetRoute("Vnet22", "100.100.1.67/32");
+        checkStateDbRouteRemoved("Vnet22", "100.100.1.67/32");
+        checkRouteNotAdvertised("100.100.1.0/24");
+
+        // Priority route with no secondary endpoints (primary == all endpoints);
+        // custom monitoring must not create any SAI BFD session.
+        setVnetRoutePriority("Vnet22", "100.100.1.71/32", "19.0.0.1,19.0.0.2",
+                             "19.0.0.1,19.0.0.2", /*primary=*/"19.0.0.1,19.0.0.2",
+                             "custom", /*adv_prefix=*/"100.100.1.0/24", "test_prf");
+        updateMonitorSessionState("100.100.1.71/32", "19.0.0.1", "up");
+        updateMonitorSessionState("100.100.1.71/32", "19.0.0.2", "up");
+        EXPECT_FALSE(bfdSessionExists("19.0.0.1"));
+        EXPECT_FALSE(bfdSessionExists("19.0.0.2"));
+        checkStateDbRoute("Vnet22", "100.100.1.71/32", "19.0.0.1,19.0.0.2");
+        checkRouteAdvertised("100.100.1.0/24", "test_prf");
+
+        // One endpoint down: route shrinks to the survivor; both down: withdrawn.
+        updateMonitorSessionState("100.100.1.71/32", "19.0.0.1", "down");
+        checkStateDbRoute("Vnet22", "100.100.1.71/32", "19.0.0.2");
+        checkRouteAdvertised("100.100.1.0/24", "test_prf");
+        updateMonitorSessionState("100.100.1.71/32", "19.0.0.2", "down");
+        checkStateDbRouteRemoved("Vnet22", "100.100.1.71/32");
+        delVnetRoute("Vnet22", "100.100.1.71/32");
+        checkStateDbRouteRemoved("Vnet22", "100.100.1.71/32");
     }
 }
