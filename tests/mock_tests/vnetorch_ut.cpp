@@ -666,10 +666,13 @@ namespace vnetorch_test
         }
 
         void setVnet(const string &name, const string &tunnel, const string &vni,
-                     const string &peer_list)
+                     const string &peer_list, bool advertise_prefix = false)
         {
+            vector<FieldValueTuple> fvs = {{"vxlan_tunnel", tunnel}, {"vni", vni},
+                                           {"peer_list", peer_list}};
+            if (advertise_prefix) fvs.push_back({"advertise_prefix", "true"});
             Table tbl(m_app_db.get(), APP_VNET_TABLE_NAME);
-            tbl.set(name, {{"vxlan_tunnel", tunnel}, {"vni", vni}, {"peer_list", peer_list}});
+            tbl.set(name, fvs);
             m_vnetOrch->addExistingData(&tbl);
             static_cast<Orch *>(m_vnetOrch)->doTask();
         }
@@ -727,10 +730,12 @@ namespace vnetorch_test
         // BFD sessions are actually created, mirroring what libsaivs/syncd would
         // have done in the VS test.
         void setVnetRouteMonitored(const string &vnet, const string &prefix,
-                                   const string &endpoints, const string &monitors)
+                                   const string &endpoints, const string &monitors,
+                                   const string &profile = "")
         {
             vector<FieldValueTuple> fvs = {{"endpoint", endpoints},
                                            {"endpoint_monitor", monitors}};
+            if (!profile.empty()) fvs.push_back({"profile", profile});
             Table tbl(m_app_db.get(), APP_VNET_RT_TUNNEL_TABLE_NAME);
             tbl.set(vnet + ":" + prefix, fvs);
             m_vnetRouteOrch->addExistingData(&tbl);
@@ -909,6 +914,27 @@ namespace vnetorch_test
             tbl.getKeys(keys);
             EXPECT_EQ(find(keys.begin(), keys.end(), prefix), keys.end())
                 << "prefix " << prefix << " unexpectedly advertised";
+        }
+
+        // Assert a prefix is present in STATE_DB ADVERTISE_NETWORK_TABLE (and,
+        // when given, carries the expected profile) --
+        // vnet_lib.check_routes_advertisement().
+        void checkRouteAdvertised(const string &prefix, const string &profile = "")
+        {
+            Table tbl(m_state_db.get(), STATE_ADVERTISE_NETWORK_TABLE_NAME);
+            vector<string> keys;
+            tbl.getKeys(keys);
+            ASSERT_NE(find(keys.begin(), keys.end(), prefix), keys.end())
+                << "prefix " << prefix << " not advertised";
+            if (!profile.empty())
+            {
+                vector<FieldValueTuple> fvs;
+                ASSERT_TRUE(tbl.get(prefix, fvs));
+                string value;
+                for (const auto &fv : fvs)
+                    if (fvField(fv) == "profile") value = fvValue(fv);
+                EXPECT_EQ(value, profile);
+            }
         }
     };
 
@@ -1578,6 +1604,122 @@ namespace vnetorch_test
                   m_rt.removedGroups.end());
         checkStateDbRouteRemoved("Vnet17", "100.100.1.1/32");
         for (const char *mon : {"9.1.0.1", "9.1.0.2", "9.1.0.3"})
+            EXPECT_FALSE(bfdSessionExists(mon)) << "BFD session " << mon << " not removed";
+    }
+
+    // BFD-monitored ECMP routes on an advertise_prefix VNET -- the mock
+    // equivalent of test_vnet_orch_12. On a VNET created with
+    // advertise_prefix=true, an active monitored route is published to STATE_DB
+    // ADVERTISE_NETWORK_TABLE (carrying its route profile); the advertisement
+    // follows the route's active/inactive state and its profile follows a
+    // make-before-break endpoint/profile change.
+    TEST_F(VNetOrchTest, VnetMonitoredEcmpRouteAdvertisesPrefix)
+    {
+        setVxlanTunnel("tunnel_12", "12.12.12.12");
+        setVnet("Vnet12", "tunnel_12", "10012", "", /*advertise_prefix=*/true);
+
+        // route1 over 1/2/3 with a profile, all monitors down: not programmed,
+        // not advertised.
+        setVnetRouteMonitored("Vnet12", "100.100.1.1/32",
+                              "12.0.0.1,12.0.0.2,12.0.0.3",
+                              "12.1.0.1,12.1.0.2,12.1.0.3", "test_profile");
+        EXPECT_EQ(findRoute("100.100.1.1"), nullptr);
+        checkStateDbRoute("Vnet12", "100.100.1.1/32", "");
+        checkRouteNotAdvertised("100.100.1.1/32");
+
+        // All up: programmed over a 3-member group and advertised with its
+        // profile.
+        updateBfdSessionState("12.1.0.1", SAI_BFD_SESSION_STATE_UP);
+        updateBfdSessionState("12.1.0.2", SAI_BFD_SESSION_STATE_UP);
+        updateBfdSessionState("12.1.0.3", SAI_BFD_SESSION_STATE_UP);
+        const RouteCaptures::Route *r1 = findRoute("100.100.1.1");
+        ASSERT_NE(r1, nullptr);
+        const sai_object_id_t nhg1 = r1->next_hop_id;
+        EXPECT_EQ(activeMembers(nhg1), 3U);
+        checkStateDbRoute("Vnet12", "100.100.1.1/32", "12.0.0.1,12.0.0.2,12.0.0.3");
+        checkRouteAdvertised("100.100.1.1/32", "test_profile");
+
+        // Endpoint 2 down: still active/advertised over the remaining members.
+        updateBfdSessionState("12.1.0.2", SAI_BFD_SESSION_STATE_DOWN);
+        EXPECT_EQ(activeMembers(nhg1), 2U);
+        checkStateDbRoute("Vnet12", "100.100.1.1/32", "12.0.0.1,12.0.0.3");
+        checkRouteAdvertised("100.100.1.1/32", "test_profile");
+
+        // Overlapping route2 over 1/2/5 (no profile), only endpoint 1 up.
+        setVnetRouteMonitored("Vnet12", "100.100.2.1/32",
+                              "12.0.0.1,12.0.0.2,12.0.0.5",
+                              "12.1.0.1,12.1.0.2,12.1.0.5");
+        const RouteCaptures::Route *r2 = findRoute("100.100.2.1");
+        ASSERT_NE(r2, nullptr);
+        const sai_object_id_t nhg2 = r2->next_hop_id;
+        EXPECT_EQ(activeMembers(nhg2), 1U);
+        checkStateDbRoute("Vnet12", "100.100.2.1/32", "12.0.0.1");
+        checkRouteAdvertised("100.100.1.1/32");
+
+        // Endpoint 5 up: route2 grows and is advertised (no profile).
+        updateBfdSessionState("12.1.0.5", SAI_BFD_SESSION_STATE_UP);
+        EXPECT_EQ(activeMembers(nhg2), 2U);
+        checkStateDbRoute("Vnet12", "100.100.2.1/32", "12.0.0.1,12.0.0.5");
+        checkRouteAdvertised("100.100.2.1/32");
+
+        // Endpoint 3 down: route1 down to endpoint 1 only, still advertised.
+        updateBfdSessionState("12.1.0.3", SAI_BFD_SESSION_STATE_DOWN);
+        EXPECT_EQ(activeMembers(nhg1), 1U);
+        checkStateDbRoute("Vnet12", "100.100.1.1/32", "12.0.0.1");
+        checkRouteAdvertised("100.100.1.1/32", "test_profile");
+
+        // Make-before-break with a new profile: route1 -> 1/2/3/4, profile
+        // test_profile2; bring endpoint 4 up. New group, old group removed, and
+        // the advertisement now carries the new profile.
+        setVnetRouteMonitored("Vnet12", "100.100.1.1/32",
+                              "12.0.0.1,12.0.0.2,12.0.0.3,12.0.0.4",
+                              "12.1.0.1,12.1.0.2,12.1.0.3,12.1.0.4", "test_profile2");
+        updateBfdSessionState("12.1.0.4", SAI_BFD_SESSION_STATE_UP);
+        const RouteCaptures::Route *r1b = findRoute("100.100.1.1");
+        ASSERT_NE(r1b, nullptr);
+        const sai_object_id_t nhg1b = r1b->next_hop_id;
+        EXPECT_NE(nhg1b, nhg1);
+        EXPECT_NE(find(m_rt.removedGroups.begin(), m_rt.removedGroups.end(), nhg1),
+                  m_rt.removedGroups.end());
+        EXPECT_EQ(activeMembers(nhg1b), 2U);
+        checkStateDbRoute("Vnet12", "100.100.1.1/32", "12.0.0.1,12.0.0.4");
+        checkRouteAdvertised("100.100.1.1/32", "test_profile2");
+
+        // Endpoint 2 back up: route1 has three members, still test_profile2.
+        updateBfdSessionState("12.1.0.2", SAI_BFD_SESSION_STATE_UP);
+        EXPECT_EQ(activeMembers(nhg1b), 3U);
+        checkStateDbRoute("Vnet12", "100.100.1.1/32", "12.0.0.1,12.0.0.2,12.0.0.4");
+        checkRouteAdvertised("100.100.1.1/32", "test_profile2");
+
+        // All of route1's monitors down: route1 removed and its advertisement
+        // withdrawn; route2 keeps only endpoint 5 and stays advertised.
+        updateBfdSessionState("12.1.0.1", SAI_BFD_SESSION_STATE_DOWN);
+        updateBfdSessionState("12.1.0.2", SAI_BFD_SESSION_STATE_DOWN);
+        updateBfdSessionState("12.1.0.3", SAI_BFD_SESSION_STATE_DOWN);
+        updateBfdSessionState("12.1.0.4", SAI_BFD_SESSION_STATE_DOWN);
+        checkStateDbRoute("Vnet12", "100.100.1.1/32", "");
+        checkRouteNotAdvertised("100.100.1.1/32");
+        EXPECT_EQ(activeMembers(nhg2), 1U);
+        checkStateDbRoute("Vnet12", "100.100.2.1/32", "12.0.0.5");
+        checkRouteAdvertised("100.100.2.1/32");
+
+        // Delete route2: group + its unique session (5) gone; route1's monitors
+        // remain.
+        delVnetRouteMonitored("Vnet12", "100.100.2.1/32");
+        EXPECT_NE(find(m_rt.removedGroups.begin(), m_rt.removedGroups.end(), nhg2),
+                  m_rt.removedGroups.end());
+        checkStateDbRouteRemoved("Vnet12", "100.100.2.1/32");
+        checkRouteNotAdvertised("100.100.2.1/32");
+        EXPECT_FALSE(bfdSessionExists("12.1.0.5"));
+        for (const char *mon : {"12.1.0.1", "12.1.0.2", "12.1.0.3", "12.1.0.4"})
+            EXPECT_TRUE(bfdSessionExists(mon)) << "BFD session " << mon << " removed too early";
+
+        // Delete route1: new group and all remaining sessions gone.
+        delVnetRouteMonitored("Vnet12", "100.100.1.1/32");
+        EXPECT_NE(find(m_rt.removedGroups.begin(), m_rt.removedGroups.end(), nhg1b),
+                  m_rt.removedGroups.end());
+        checkStateDbRouteRemoved("Vnet12", "100.100.1.1/32");
+        for (const char *mon : {"12.1.0.1", "12.1.0.2", "12.1.0.3", "12.1.0.4"})
             EXPECT_FALSE(bfdSessionExists(mon)) << "BFD session " << mon << " not removed";
     }
 }
