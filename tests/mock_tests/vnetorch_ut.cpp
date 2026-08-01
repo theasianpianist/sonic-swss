@@ -802,7 +802,8 @@ namespace vnetorch_test
                                   const string &primary,
                                   const string &monitoring = "custom",
                                   const string &adv_prefix = "",
-                                  const string &profile = "")
+                                  const string &profile = "",
+                                  bool check_directly_connected = false)
         {
             vector<FieldValueTuple> fvs = {{"endpoint", endpoints},
                                            {"endpoint_monitor", monitors},
@@ -810,6 +811,7 @@ namespace vnetorch_test
                                            {"monitoring", monitoring}};
             if (!adv_prefix.empty()) fvs.push_back({"adv_prefix", adv_prefix});
             if (!profile.empty()) fvs.push_back({"profile", profile});
+            if (check_directly_connected) fvs.push_back({"check_directly_connected", "true"});
             Table tbl(m_app_db.get(), APP_VNET_RT_TUNNEL_TABLE_NAME);
             tbl.set(vnet + ":" + prefix, fvs);
             m_vnetRouteOrch->addExistingData(&tbl);
@@ -866,6 +868,66 @@ namespace vnetorch_test
                 gBfdOrch->getExecutor(APP_BFD_SESSION_TABLE_NAME));
             consumer->addToSync(entries);
             static_cast<Orch *>(gBfdOrch)->doTask(*consumer);
+        }
+
+        // Program a directly-connected (local) endpoint. Creates an L3 router
+        // interface on a port with an IP address, mirroring the VS
+        // create_l3_intf + add_ip_address sequence. intfmgrd/portmgrd normally
+        // translate CONFIG_DB to these APP_DB rows; the ports are already
+        // admin-up from ApplyInitialConfigs. gIntfsOrch is the shared global the
+        // base fixture rebuilds per test.
+        void createL3Interface(const string &port, const string &ipPrefix)
+        {
+            Table intfTable(m_app_db.get(), APP_INTF_TABLE_NAME);
+            intfTable.set(port, {{"NULL", "NULL"}});
+            intfTable.set(port + ":" + ipPrefix, {{"scope", "global"}, {"family", "IPv4"}});
+            gIntfsOrch->addExistingData(&intfTable);
+            static_cast<Orch *>(gIntfsOrch)->doTask();
+        }
+
+        // Resolve a neighbor on a router interface so VNetRouteOrch's
+        // isLocalEndpoint() finds it (gNeighOrch->getNeighborEntry) and the
+        // route reuses the IP next hop gNeighOrch creates for it, instead of a
+        // tunnel-encap next hop. Mock equivalent of the VS add_neighbor (which
+        // neighsyncd normally produces from a kernel netlink event).
+        void addNeighbor(const string &port, const string &ip, const string &mac)
+        {
+            Table neighTable(m_app_db.get(), APP_NEIGH_TABLE_NAME);
+            neighTable.set(port + ":" + ip, {{"neigh", mac}, {"family", "IPv4"}});
+            gNeighOrch->addExistingData(&neighTable);
+            static_cast<Orch *>(gNeighOrch)->doTask();
+        }
+
+        // Assert the (still-present) next hop for endpoint ip carries the given
+        // SAI next hop type. A directly-connected/local endpoint resolves to a
+        // SAI_NEXT_HOP_TYPE_IP next hop (created by gNeighOrch), whereas a remote
+        // overlay endpoint resolves to a SAI_NEXT_HOP_TYPE_TUNNEL_ENCAP next hop.
+        // This is the distinguishing behavior of a check_directly_connected route
+        // and is invisible to STATE_DB active_endpoints alone.
+        void checkEndpointType(const string &ip, int32_t type) const
+        {
+            for (auto it = m_rt.nexthops.rbegin(); it != m_rt.nexthops.rend(); ++it)
+            {
+                if (ipAddrEquals(it->ip, ip) &&
+                    find(m_rt.removedNexthops.begin(), m_rt.removedNexthops.end(),
+                         it->oid) == m_rt.removedNexthops.end())
+                {
+                    EXPECT_EQ(it->type, type)
+                        << "endpoint " << ip << " has unexpected next hop type";
+                    return;
+                }
+            }
+            ADD_FAILURE() << "no active next hop for endpoint " << ip;
+        }
+
+        void checkEndpointIsLocal(const string &ip) const
+        {
+            checkEndpointType(ip, SAI_NEXT_HOP_TYPE_IP);
+        }
+
+        void checkEndpointIsRemote(const string &ip) const
+        {
+            checkEndpointType(ip, SAI_NEXT_HOP_TYPE_TUNNEL_ENCAP);
         }
 
         // The captured OID for the (still-existing) BFD session monitoring addr,
@@ -2636,5 +2698,132 @@ namespace vnetorch_test
             EXPECT_EQ(findRoute("0.0.0." + to_string(i)), nullptr);
             checkStateDbRouteRemoved("Vnet33", prefix);
         }
+    }
+
+    // Mock equivalent of test_vnet_orch_29: a priority (custom-monitored) route
+    // whose secondary endpoints are directly-connected/local. The primary subset
+    // {9.1.0.1,9.1.0.2} is remote (tunnel-encap next hops); the secondary subset
+    // {9.1.0.3,9.1.0.4} is local, resolved through neighbor IP next hops, enabled
+    // by check_directly_connected. The failover ladder matches test 18, but when
+    // the route falls back to the secondary it must point at local IP next hops
+    // rather than tunnel next hops -- a distinction STATE_DB active_endpoints
+    // alone cannot show, so we additionally assert each active endpoint's next
+    // hop type (checkEndpointIsLocal/Remote). Like the VS test, the secondary
+    // states are backbone-checked via STATE_DB (its ASIC helper only matches
+    // tunnel next hops), while the primary states use the full priority-route
+    // group check.
+    TEST_F(VNetOrchTest, VnetPriorityRouteLocalSecondaryFailover)
+    {
+        setVxlanTunnel("tunnel_29", "9.9.9.9");
+        setVnet("Vnet29", "tunnel_29", "10029", "", /*advertise_prefix=*/true,
+                /*overlay_dmac=*/"22:33:33:44:44:66");
+
+        // Two directly-connected local endpoints: each is its own /32 interface
+        // with a neighbor resolved at the same address (as the VS test wires it).
+        createL3Interface("Ethernet8", "9.1.0.3/32");
+        createL3Interface("Ethernet12", "9.1.0.4/32");
+        addNeighbor("Ethernet8", "9.1.0.3", "00:01:02:03:04:05");
+        addNeighbor("Ethernet12", "9.1.0.4", "00:01:02:03:04:06");
+
+        // gNeighOrch created an IP (directly-connected) next hop for each local
+        // endpoint the moment the neighbor resolved.
+        checkEndpointIsLocal("9.1.0.3");
+        checkEndpointIsLocal("9.1.0.4");
+
+        // primary {1,2} remote, secondary {3,4} local, custom monitoring.
+        setVnetRoutePriority("Vnet29", "100.100.1.1/32",
+                             "9.1.0.1,9.1.0.2,9.1.0.3,9.1.0.4",
+                             "9.1.0.1,9.1.0.2,9.1.0.3,9.1.0.4",
+                             /*primary=*/"9.1.0.1,9.1.0.2",
+                             /*monitoring=*/"custom",
+                             /*adv_prefix=*/"100.100.1.0/24",
+                             /*profile=*/"",
+                             /*check_directly_connected=*/true);
+
+        // All monitors down: route not programmed, adv_prefix not advertised.
+        for (const char *m : {"9.1.0.1", "9.1.0.2", "9.1.0.3", "9.1.0.4"})
+            checkCustomMonitorAppDb("100.100.1.1/32", m, "vxlan", "22:33:33:44:44:66");
+        EXPECT_EQ(findRoute("100.100.1.1"), nullptr);
+        checkStateDbRoute("Vnet29", "100.100.1.1/32", "");
+        checkRouteNotAdvertised("100.100.1.0/24");
+
+        // All monitors up: only the remote primary subset {1,2} is used.
+        updateMonitorSessionState("100.100.1.1/32", "9.1.0.1", "up");
+        updateMonitorSessionState("100.100.1.1/32", "9.1.0.2", "up");
+        updateMonitorSessionState("100.100.1.1/32", "9.1.0.3", "up");
+        updateMonitorSessionState("100.100.1.1/32", "9.1.0.4", "up");
+        checkPriorityRoute("100.100.1.1", {"9.1.0.1", "9.1.0.2"});
+        checkEndpointIsRemote("9.1.0.1");
+        checkEndpointIsRemote("9.1.0.2");
+        checkStateDbRoute("Vnet29", "100.100.1.1/32", "9.1.0.1,9.1.0.2");
+        checkRouteAdvertised("100.100.1.0/24");
+
+        // First primary down: route stays on the remaining primary {1}.
+        updateMonitorSessionState("100.100.1.1/32", "9.1.0.2", "down");
+        checkPriorityRoute("100.100.1.1", {"9.1.0.1"});
+        checkStateDbRoute("Vnet29", "100.100.1.1/32", "9.1.0.1");
+        checkRouteAdvertised("100.100.1.0/24");
+
+        // Both primaries down: fall back to the local secondary subset {3,4}.
+        updateMonitorSessionState("100.100.1.1/32", "9.1.0.1", "down");
+        checkStateDbRoute("Vnet29", "100.100.1.1/32", "9.1.0.3,9.1.0.4");
+        checkEndpointIsLocal("9.1.0.3");
+        checkEndpointIsLocal("9.1.0.4");
+        checkRouteAdvertised("100.100.1.0/24");
+
+        // First secondary down: route stays on the remaining secondary {4}.
+        updateMonitorSessionState("100.100.1.1/32", "9.1.0.3", "down");
+        checkStateDbRoute("Vnet29", "100.100.1.1/32", "9.1.0.4");
+        checkEndpointIsLocal("9.1.0.4");
+        checkRouteAdvertised("100.100.1.0/24");
+
+        // Last secondary down: every endpoint down, route withdrawn, adv removed.
+        updateMonitorSessionState("100.100.1.1/32", "9.1.0.4", "down");
+        EXPECT_EQ(findRoute("100.100.1.1"), nullptr);
+        checkStateDbRouteRemoved("Vnet29", "100.100.1.1/32");
+        checkRouteNotAdvertised("100.100.1.0/24");
+
+        // Secondary endpoints back up: route re-added on the local secondary {3,4}.
+        updateMonitorSessionState("100.100.1.1/32", "9.1.0.3", "up");
+        updateMonitorSessionState("100.100.1.1/32", "9.1.0.4", "up");
+        checkStateDbRoute("Vnet29", "100.100.1.1/32", "9.1.0.3,9.1.0.4");
+        checkEndpointIsLocal("9.1.0.3");
+        checkEndpointIsLocal("9.1.0.4");
+        checkRouteAdvertised("100.100.1.0/24");
+
+        // First primary back up: route switches back to the remote primary {1}.
+        updateMonitorSessionState("100.100.1.1/32", "9.1.0.1", "up");
+        checkPriorityRoute("100.100.1.1", {"9.1.0.1"});
+        checkEndpointIsRemote("9.1.0.1");
+        checkStateDbRoute("Vnet29", "100.100.1.1/32", "9.1.0.1");
+        checkRouteAdvertised("100.100.1.0/24");
+
+        // Second primary up: primary subset {1,2}.
+        updateMonitorSessionState("100.100.1.1/32", "9.1.0.2", "up");
+        checkPriorityRoute("100.100.1.1", {"9.1.0.1", "9.1.0.2"});
+        checkStateDbRoute("Vnet29", "100.100.1.1/32", "9.1.0.1,9.1.0.2");
+        checkRouteAdvertised("100.100.1.0/24");
+
+        // Secondary going down does not affect a primary-active route.
+        updateMonitorSessionState("100.100.1.1/32", "9.1.0.3", "down");
+        updateMonitorSessionState("100.100.1.1/32", "9.1.0.4", "down");
+        checkPriorityRoute("100.100.1.1", {"9.1.0.1", "9.1.0.2"});
+        checkStateDbRoute("Vnet29", "100.100.1.1/32", "9.1.0.1,9.1.0.2");
+        checkRouteAdvertised("100.100.1.0/24");
+
+        // Secondary coming back up does not affect it either.
+        updateMonitorSessionState("100.100.1.1/32", "9.1.0.3", "up");
+        updateMonitorSessionState("100.100.1.1/32", "9.1.0.4", "up");
+        checkPriorityRoute("100.100.1.1", {"9.1.0.1", "9.1.0.2"});
+        checkStateDbRoute("Vnet29", "100.100.1.1/32", "9.1.0.1,9.1.0.2");
+        checkRouteAdvertised("100.100.1.0/24");
+
+        // Delete the route: withdrawn, STATE_DB cleared, monitors removed.
+        delVnetRoute("Vnet29", "100.100.1.1/32");
+        EXPECT_EQ(findRoute("100.100.1.1"), nullptr);
+        checkStateDbRouteRemoved("Vnet29", "100.100.1.1/32");
+        checkRouteNotAdvertised("100.100.1.0/24");
+        for (const char *m : {"9.1.0.1", "9.1.0.2", "9.1.0.3", "9.1.0.4"})
+            checkCustomMonitorDeleted("100.100.1.1/32", m);
     }
 }
