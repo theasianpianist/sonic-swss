@@ -90,8 +90,13 @@ namespace vnetorch_test
     static bool ipAddrEquals(const sai_ip_address_t &a, const string &ip)
     {
         swss::IpAddress expected(ip);
-        return a.addr_family == SAI_IP_ADDR_FAMILY_IPV4 &&
-               a.addr.ip4 == expected.getV4Addr();
+        if (expected.isV4())
+        {
+            return a.addr_family == SAI_IP_ADDR_FAMILY_IPV4 &&
+                   a.addr.ip4 == expected.getV4Addr();
+        }
+        return a.addr_family == SAI_IP_ADDR_FAMILY_IPV6 &&
+               memcmp(a.addr.ip6, expected.getV6Addr(), sizeof(a.addr.ip6)) == 0;
     }
 
     static bool saiMacEquals(const sai_mac_t &m, const string &mac)
@@ -103,8 +108,13 @@ namespace vnetorch_test
     static bool prefixAddrEquals(const sai_ip_prefix_t &p, const string &ip)
     {
         swss::IpAddress expected(ip);
-        return p.addr_family == SAI_IP_ADDR_FAMILY_IPV4 &&
-               p.addr.ip4 == expected.getV4Addr();
+        if (expected.isV4())
+        {
+            return p.addr_family == SAI_IP_ADDR_FAMILY_IPV4 &&
+                   p.addr.ip4 == expected.getV4Addr();
+        }
+        return p.addr_family == SAI_IP_ADDR_FAMILY_IPV6 &&
+               memcmp(p.addr.ip6, expected.getV6Addr(), sizeof(p.addr.ip6)) == 0;
     }
 
     // Captured VXLAN tunnel SAI objects with the attributes VNetOrch /
@@ -191,6 +201,46 @@ namespace vnetorch_test
         vector<sai_object_id_t> removedMembers;
         vector<sai_ip_prefix_t> removedRoutes;
     };
+
+    // set_route_entry_attribute is not routed through the mock_sai_api framework
+    // (its macro only mocks create/remove), yet VNetRouteOrch::update_route
+    // repoints a route in place via this SET when an ECMP route's endpoint set
+    // changes. We swap the single function pointer to a trampoline that records
+    // the new NEXT_HOP_ID onto the matching captured route (so a captured
+    // route's next_hop_id reflects its current value, mirroring the ASIC_DB read
+    // in check_vnet_ecmp_routes), then calls through to real libsaivs. gtest
+    // runs tests serially, so a file-scope active pointer is safe.
+    static RouteCaptures *g_activeRouteCaptures = nullptr;
+    static sai_status_t (*g_savedSetRouteAttr)(const sai_route_entry_t *,
+                                               const sai_attribute_t *) = nullptr;
+
+    static bool saiIpPrefixEquals(const sai_ip_prefix_t &a, const sai_ip_prefix_t &b)
+    {
+        if (a.addr_family != b.addr_family) return false;
+        if (a.addr_family == SAI_IP_ADDR_FAMILY_IPV4)
+        {
+            return a.addr.ip4 == b.addr.ip4 && a.mask.ip4 == b.mask.ip4;
+        }
+        return memcmp(a.addr.ip6, b.addr.ip6, sizeof(a.addr.ip6)) == 0 &&
+               memcmp(a.mask.ip6, b.mask.ip6, sizeof(a.mask.ip6)) == 0;
+    }
+
+    static sai_status_t captureSetRouteEntryAttr(const sai_route_entry_t *e,
+                                                 const sai_attribute_t *attr)
+    {
+        if (g_activeRouteCaptures && e && attr &&
+            attr->id == SAI_ROUTE_ENTRY_ATTR_NEXT_HOP_ID)
+        {
+            for (auto &r : g_activeRouteCaptures->routes)
+            {
+                if (r.vr == e->vr_id && saiIpPrefixEquals(r.dest, e->destination))
+                {
+                    r.next_hop_id = attr->value.oid;
+                }
+            }
+        }
+        return g_savedSetRouteAttr(e, attr);
+    }
 
     class VNetOrchTest : public MockOrchTest
     {
@@ -297,6 +347,14 @@ namespace vnetorch_test
             gTunneldecapOrch = nullptr;
 
             restoreTunnelMock();
+            // Restore the route SET pointer before the mock framework swaps the
+            // route api struct back (symmetric with installRouteMock()).
+            if (g_savedSetRouteAttr)
+            {
+                sai_route_api->set_route_entry_attribute = g_savedSetRouteAttr;
+                g_savedSetRouteAttr = nullptr;
+            }
+            g_activeRouteCaptures = nullptr;
             m_vrMock.reset();
             RestoreSaiApis();
             DEINIT_SAI_API_MOCK(virtual_router);
@@ -512,6 +570,11 @@ namespace vnetorch_test
                     m_rt.removedRoutes.push_back(e->destination);
                     return old_sai_route_api->remove_route_entry(e);
                 }));
+
+            // Capture in-place route repoints too (see captureSetRouteEntryAttr).
+            g_activeRouteCaptures = &m_rt;
+            g_savedSetRouteAttr = sai_route_api->set_route_entry_attribute;
+            sai_route_api->set_route_entry_attribute = captureSetRouteEntryAttr;
         }
 
         // The VS test writes VXLAN_TUNNEL / VNET to CONFIG_DB and relies on
@@ -580,8 +643,9 @@ namespace vnetorch_test
             static_cast<Orch *>(m_vnetRouteOrch.get())->doTask(*consumer);
         }
 
-        // Find the captured route for an IPv4 prefix, skipping the VNET's IPv6
-        // link-local route that RouteOrch programs during bind.
+        // Find the captured route for a host prefix (IPv4 or IPv6), skipping the
+        // VNET's IPv6 link-local (fe80::/10) route that RouteOrch programs during
+        // bind -- its address never matches a VNET route's endpoint prefix.
         const RouteCaptures::Route *findRoute(const string &ip) const
         {
             for (const auto &r : m_rt.routes)
@@ -592,6 +656,49 @@ namespace vnetorch_test
                 }
             }
             return nullptr;
+        }
+
+        // STATE_DB VNET_ROUTE_TUNNEL_TABLE assertions -- the mock equivalent of
+        // vnet_lib.check_state_db_routes(). VNetRouteOrch writes this table via a
+        // plain swss::Table on STATE_DB, so it is directly readable here (unlike
+        // ASIC_DB). activeEndpoints is the comma-joined list of active endpoints
+        // in ascending order (NextHopKey/std::map order), which matches the
+        // ascending test data.
+        void checkStateDbRoute(const string &vnet, const string &prefix,
+                               const string &activeEndpoints)
+        {
+            Table tbl(m_state_db.get(), STATE_VNET_RT_TUNNEL_TABLE_NAME);
+            vector<FieldValueTuple> fvs;
+            ASSERT_TRUE(tbl.get(vnet + "|" + prefix, fvs))
+                << "missing STATE_DB route " << vnet << "|" << prefix;
+            string active, state;
+            for (const auto &fv : fvs)
+            {
+                if (fvField(fv) == "active_endpoints") active = fvValue(fv);
+                else if (fvField(fv) == "state") state = fvValue(fv);
+            }
+            EXPECT_EQ(active, activeEndpoints);
+            EXPECT_EQ(state, activeEndpoints.empty() ? "inactive" : "active");
+        }
+
+        void checkStateDbRouteRemoved(const string &vnet, const string &prefix)
+        {
+            Table tbl(m_state_db.get(), STATE_VNET_RT_TUNNEL_TABLE_NAME);
+            vector<FieldValueTuple> fvs;
+            EXPECT_FALSE(tbl.get(vnet + "|" + prefix, fvs))
+                << "STATE_DB route " << vnet << "|" << prefix << " not removed";
+        }
+
+        // The default VNET does not advertise prefixes, so the prefix must be
+        // absent from STATE_DB ADVERTISE_NETWORK_TABLE --
+        // vnet_lib.check_remove_routes_advertisement().
+        void checkRouteNotAdvertised(const string &prefix)
+        {
+            Table tbl(m_state_db.get(), STATE_ADVERTISE_NETWORK_TABLE_NAME);
+            vector<string> keys;
+            tbl.getKeys(keys);
+            EXPECT_EQ(find(keys.begin(), keys.end(), prefix), keys.end())
+                << "prefix " << prefix << " unexpectedly advertised";
         }
     };
 
@@ -838,5 +945,137 @@ namespace vnetorch_test
         EXPECT_TRUE(routeRemoved);
         EXPECT_NE(find(m_rt.removedNexthops.begin(), m_rt.removedNexthops.end(), nhOid),
                   m_rt.removedNexthops.end());
+    }
+
+    // Re-applying an identical multi-endpoint IPv6 VNET route is idempotent: the
+    // second SET reuses the existing next hop group rather than creating a new
+    // one, and STATE_DB still reports the same active endpoints -- the mock
+    // equivalent of test_vnet_orch_13 (check_vnet_ecmp_routes with route_ids
+    // reused + "only one group is present"). The default VNET does not advertise
+    // the prefix.
+    TEST_F(VNetOrchTest, VnetEcmpRouteReaddIsIdempotent)
+    {
+        setVxlanTunnel("tunnel_13", "fd:8::32");
+        setVnet("Vnet13", "tunnel_13", "10008", "");
+
+        setVnetRoute("Vnet13", "fd:8:10::32/128", "fd:8:1::1,fd:8:1::2,fd:8:1::3");
+
+        // One ECMP group with three members on the first apply.
+        ASSERT_EQ(m_rt.groups.size(), 1U);
+        const sai_object_id_t nhg = m_rt.groups[0].oid;
+        EXPECT_EQ(m_rt.members.size(), 3U);
+        const RouteCaptures::Route *r = findRoute("fd:8:10::32");
+        ASSERT_NE(r, nullptr);
+        EXPECT_EQ(r->next_hop_id, nhg);
+        checkStateDbRoute("Vnet13", "fd:8:10::32/128", "fd:8:1::1,fd:8:1::2,fd:8:1::3");
+        checkRouteNotAdvertised("fd:8:10::32/128");
+
+        // Re-apply the identical route: no new group or members, same group OID,
+        // nothing removed.
+        setVnetRoute("Vnet13", "fd:8:10::32/128", "fd:8:1::1,fd:8:1::2,fd:8:1::3");
+        EXPECT_EQ(m_rt.groups.size(), 1U);
+        EXPECT_EQ(m_rt.members.size(), 3U);
+        EXPECT_TRUE(m_rt.removedGroups.empty());
+        r = findRoute("fd:8:10::32");
+        ASSERT_NE(r, nullptr);
+        EXPECT_EQ(r->next_hop_id, nhg);
+        checkStateDbRoute("Vnet13", "fd:8:10::32/128", "fd:8:1::1,fd:8:1::2,fd:8:1::3");
+        checkRouteNotAdvertised("fd:8:10::32/128");
+
+        // Deleting removes the route, its group and its STATE_DB entry.
+        delVnetRoute("Vnet13", "fd:8:10::32/128");
+        EXPECT_NE(find(m_rt.removedGroups.begin(), m_rt.removedGroups.end(), nhg),
+                  m_rt.removedGroups.end());
+        checkStateDbRouteRemoved("Vnet13", "fd:8:10::32/128");
+        checkRouteNotAdvertised("fd:8:10::32/128");
+    }
+
+    // Changing a multi-endpoint route's endpoint set replaces the next hop
+    // group: a new group is created for the new endpoints, the old group is
+    // removed, and the route repoints -- the mock equivalent of
+    // test_vnet_orch_14 (re-add idempotent, then endpoint update swaps the
+    // group). Deleting twice is idempotent (the second delete is a no-op).
+    TEST_F(VNetOrchTest, VnetEcmpRouteEndpointUpdateReplacesGroup)
+    {
+        setVxlanTunnel("tunnel_14", "fd:8::32");
+        setVnet("Vnet14", "tunnel_14", "10008", "");
+
+        setVnetRoute("Vnet14", "fd:8:10::32/128", "fd:8:1::1,fd:8:1::2,fd:8:1::3");
+        ASSERT_EQ(m_rt.groups.size(), 1U);
+        const sai_object_id_t oldNhg = m_rt.groups[0].oid;
+        checkStateDbRoute("Vnet14", "fd:8:10::32/128", "fd:8:1::1,fd:8:1::2,fd:8:1::3");
+
+        // Re-apply identical endpoints: still one group (idempotent).
+        setVnetRoute("Vnet14", "fd:8:10::32/128", "fd:8:1::1,fd:8:1::2,fd:8:1::3");
+        EXPECT_EQ(m_rt.groups.size(), 1U);
+        EXPECT_TRUE(m_rt.removedGroups.empty());
+
+        // Update the endpoint set (add a fourth endpoint): a new four-member
+        // group is created and the old group removed; the route repoints.
+        setVnetRoute("Vnet14", "fd:8:10::32/128",
+                     "fd:8:1::1,fd:8:1::2,fd:8:1::3,fd:8:1::4");
+        ASSERT_EQ(m_rt.groups.size(), 2U);
+        const sai_object_id_t newNhg = m_rt.groups[1].oid;
+        EXPECT_NE(newNhg, oldNhg);
+        EXPECT_NE(find(m_rt.removedGroups.begin(), m_rt.removedGroups.end(), oldNhg),
+                  m_rt.removedGroups.end());
+        int newMembers = 0;
+        for (const auto &m : m_rt.members) if (m.nhg == newNhg) newMembers++;
+        EXPECT_EQ(newMembers, 4);
+        const RouteCaptures::Route *r = findRoute("fd:8:10::32");
+        ASSERT_NE(r, nullptr);
+        EXPECT_EQ(r->next_hop_id, newNhg);
+        checkStateDbRoute("Vnet14", "fd:8:10::32/128",
+                          "fd:8:1::1,fd:8:1::2,fd:8:1::3,fd:8:1::4");
+        checkRouteNotAdvertised("fd:8:10::32/128");
+
+        // Delete, then delete again: the second delete removes nothing more.
+        delVnetRoute("Vnet14", "fd:8:10::32/128");
+        checkStateDbRouteRemoved("Vnet14", "fd:8:10::32/128");
+        EXPECT_NE(find(m_rt.removedGroups.begin(), m_rt.removedGroups.end(), newNhg),
+                  m_rt.removedGroups.end());
+        const size_t removedGroupsAfterFirst = m_rt.removedGroups.size();
+
+        delVnetRoute("Vnet14", "fd:8:10::32/128");
+        EXPECT_EQ(m_rt.removedGroups.size(), removedGroupsAfterFirst);
+        checkStateDbRouteRemoved("Vnet14", "fd:8:10::32/128");
+    }
+
+    // Re-applying an identical single-endpoint IPv6 VNET route is idempotent:
+    // the second SET reuses the existing tunnel next hop and creates no group --
+    // the mock equivalent of test_vnet_orch_15 ("only one" next hop present).
+    TEST_F(VNetOrchTest, VnetSingleRouteReaddIsIdempotent)
+    {
+        setVxlanTunnel("tunnel_15", "fd:8::32");
+        setVnet("Vnet15", "tunnel_15", "10008", "");
+
+        setVnetRoute("Vnet15", "fd:8:10::32/128", "fd:8:1::1");
+        ASSERT_EQ(m_rt.nexthops.size(), 1U);
+        const sai_object_id_t nhOid = m_rt.nexthops[0].oid;
+        EXPECT_TRUE(m_rt.groups.empty());
+        const RouteCaptures::Route *r = findRoute("fd:8:10::32");
+        ASSERT_NE(r, nullptr);
+        EXPECT_EQ(r->next_hop_id, nhOid);
+        checkStateDbRoute("Vnet15", "fd:8:10::32/128", "fd:8:1::1");
+        checkRouteNotAdvertised("fd:8:10::32/128");
+
+        // Re-apply identical: no new next hop, still no group.
+        setVnetRoute("Vnet15", "fd:8:10::32/128", "fd:8:1::1");
+        EXPECT_EQ(m_rt.nexthops.size(), 1U);
+        EXPECT_TRUE(m_rt.groups.empty());
+        r = findRoute("fd:8:10::32");
+        ASSERT_NE(r, nullptr);
+        EXPECT_EQ(r->next_hop_id, nhOid);
+        checkStateDbRoute("Vnet15", "fd:8:10::32/128", "fd:8:1::1");
+
+        // Deleting removes the route, the tunnel next hop and its STATE_DB entry.
+        delVnetRoute("Vnet15", "fd:8:10::32/128");
+        bool routeRemoved = false;
+        for (const auto &d : m_rt.removedRoutes)
+            if (prefixAddrEquals(d, "fd:8:10::32")) routeRemoved = true;
+        EXPECT_TRUE(routeRemoved);
+        EXPECT_NE(find(m_rt.removedNexthops.begin(), m_rt.removedNexthops.end(), nhOid),
+                  m_rt.removedNexthops.end());
+        checkStateDbRouteRemoved("Vnet15", "fd:8:10::32/128");
     }
 }
