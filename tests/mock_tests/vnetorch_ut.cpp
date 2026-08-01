@@ -532,6 +532,11 @@ namespace vnetorch_test
             TableConnector stateDbBfdSessionTable(m_state_db.get(), STATE_BFD_SESSION_TABLE_NAME);
             gBfdOrch = new BfdOrch(m_app_db.get(), APP_BFD_SESSION_TABLE_NAME, stateDbBfdSessionTable);
 
+            // BgpGlobalStateOrch::doTask() resolves BfdOrch via gDirectory to
+            // drive handleTsaStateChange() on a TSA state change, so register
+            // gBfdOrch the same way orchdaemon does (orchdaemon.cpp:269).
+            gDirectory.set(gBfdOrch);
+
             // VNetRouteOrch::postRouteState() dereferences gTunneldecapOrch
             // (getSubnetDecapConfig()) on every tunnel route, so it must exist
             // before any route task runs. Subnet decap is disabled by default,
@@ -1166,6 +1171,25 @@ namespace vnetorch_test
             consumer->readData();
             static_cast<Orch *>(gBfdOrch)->doTask(*consumer);
             mockReply = nullptr;
+        }
+
+        // Enable/disable Traffic-Shift-Away, the mock equivalent of vnet_lib
+        // set_tsa()/clear_tsa() (which write CONFIG_DB BGP_DEVICE_GLOBAL|STATE
+        // tsa_enabled). BgpGlobalStateOrch consumes it and calls
+        // BfdOrch::handleTsaStateChange(): on enable it synchronously notifies
+        // every shutdown_bfd_during_tsa session down (withdrawing the monitored
+        // routes through them) and removes the SAI sessions; on disable it
+        // recreates them (initial state down), so routes stay withdrawn until
+        // their monitors report up again.
+        void setTsa(bool enabled)
+        {
+            const string val = enabled ? "true" : "false";
+            Table tbl(m_config_db.get(), CFG_BGP_DEVICE_GLOBAL_TABLE_NAME);
+            tbl.set("STATE", {{"tsa_enabled", val}});
+            auto consumer = dynamic_cast<Consumer *>(
+                m_bgpGlobalStateOrch->getExecutor(CFG_BGP_DEVICE_GLOBAL_TABLE_NAME));
+            consumer->addToSync({{"STATE", SET_COMMAND, {{"tsa_enabled", val}}}});
+            static_cast<Orch *>(m_bgpGlobalStateOrch)->doTask(*consumer);
         }
 
         // Members currently bound to nhg: created for this group and not since
@@ -3361,5 +3385,86 @@ namespace vnetorch_test
         // Delete removes the route.
         delVnetLocalRoute("Vnet5001", "10.10.0.0/24");
         checkVnetLocalRouteRemoved("10.10.0.0/24");
+    }
+
+    // BFD-monitored ECMP VNET route through a Traffic-Shift-Away cycle -- the
+    // mock equivalent of test_vnet_orch_25. TSA (BGP_DEVICE_GLOBAL|STATE
+    // tsa_enabled) drives BfdOrch::handleTsaStateChange, which tears down every
+    // BFD session (withdrawing the routes monitored through them) and later
+    // recreates them:
+    //  * all monitors up -> route programmed over the ECMP group;
+    //  * set TSA -> all BFD sessions removed, route withdrawn, STATE_DB
+    //    inactive;
+    //  * clear TSA -> sessions recreated (initially down) so the route stays
+    //    withdrawn; bringing the monitors up again restores the route over the
+    //    same (persisted) group;
+    //  * deleting the route removes the group and its BFD sessions.
+    TEST_F(VNetOrchTest, VnetMonitoredEcmpRouteTsaWithdrawsAndRestores)
+    {
+        setVxlanTunnel("tunnel_25", "9.9.9.9");
+        setVnet("Vnet25", "tunnel_25", "10025", "");
+
+        setVnetRouteMonitored("Vnet25", "125.100.1.1/32",
+                              "9.0.0.1,9.0.0.2,9.0.0.3", "9.1.0.1,9.1.0.2,9.1.0.3");
+
+        // Default BFD state is down: the route is not programmed, STATE_DB is
+        // inactive, and the default VNET does not advertise the prefix.
+        EXPECT_EQ(findRoute("125.100.1.1"), nullptr);
+        checkStateDbRoute("Vnet25", "125.100.1.1/32", "");
+        checkRouteNotAdvertised("125.100.1.1/32");
+
+        // All monitors up: the route is programmed over the ECMP group with a
+        // member per endpoint.
+        updateBfdSessionState("9.1.0.1", SAI_BFD_SESSION_STATE_UP);
+        updateBfdSessionState("9.1.0.2", SAI_BFD_SESSION_STATE_UP);
+        updateBfdSessionState("9.1.0.3", SAI_BFD_SESSION_STATE_UP);
+        const RouteCaptures::Route *r = findRoute("125.100.1.1");
+        ASSERT_NE(r, nullptr);
+        const sai_object_id_t nhg = r->next_hop_id;
+        EXPECT_NE(nhg, SAI_NULL_OBJECT_ID);
+        EXPECT_EQ(activeMembers(nhg), 3U);
+        checkStateDbRoute("Vnet25", "125.100.1.1/32", "9.0.0.1,9.0.0.2,9.0.0.3");
+        checkRouteNotAdvertised("125.100.1.1/32");
+
+        // Enable TSA: every BFD session is removed and the route is withdrawn
+        // (STATE_DB inactive), but the ECMP group persists (as on all-down).
+        setTsa(true);
+        for (const char *mon : {"9.1.0.1", "9.1.0.2", "9.1.0.3"})
+            EXPECT_FALSE(bfdSessionExists(mon)) << "BFD session " << mon << " not removed by TSA";
+        bool routeRemoved = false;
+        for (const auto &d : m_rt.removedRoutes)
+            if (prefixAddrEquals(d, "125.100.1.1")) routeRemoved = true;
+        EXPECT_TRUE(routeRemoved);
+        EXPECT_EQ(activeMembers(nhg), 0U);
+        checkStateDbRoute("Vnet25", "125.100.1.1/32", "");
+        checkRouteNotAdvertised("125.100.1.1/32");
+
+        // Clear TSA: the BFD sessions are recreated but start down, so the route
+        // stays withdrawn until the monitors report up.
+        setTsa(false);
+        for (const char *mon : {"9.1.0.1", "9.1.0.2", "9.1.0.3"})
+            EXPECT_TRUE(bfdSessionExists(mon)) << "BFD session " << mon << " not recreated after TSA clear";
+        EXPECT_EQ(activeMembers(nhg), 0U);
+        checkStateDbRoute("Vnet25", "125.100.1.1/32", "");
+
+        // Monitors up again: the route is restored over the same persisted group.
+        updateBfdSessionState("9.1.0.1", SAI_BFD_SESSION_STATE_UP);
+        updateBfdSessionState("9.1.0.2", SAI_BFD_SESSION_STATE_UP);
+        updateBfdSessionState("9.1.0.3", SAI_BFD_SESSION_STATE_UP);
+        const RouteCaptures::Route *r2 = findRoute("125.100.1.1");
+        ASSERT_NE(r2, nullptr);
+        EXPECT_EQ(r2->next_hop_id, nhg);
+        EXPECT_EQ(activeMembers(nhg), 3U);
+        checkStateDbRoute("Vnet25", "125.100.1.1/32", "9.0.0.1,9.0.0.2,9.0.0.3");
+        checkRouteNotAdvertised("125.100.1.1/32");
+
+        // Deleting the route removes the group, its STATE_DB entry, and the BFD
+        // sessions for all its monitors.
+        delVnetRouteMonitored("Vnet25", "125.100.1.1/32");
+        EXPECT_NE(find(m_rt.removedGroups.begin(), m_rt.removedGroups.end(), nhg),
+                  m_rt.removedGroups.end());
+        checkStateDbRouteRemoved("Vnet25", "125.100.1.1/32");
+        for (const char *mon : {"9.1.0.1", "9.1.0.2", "9.1.0.3"})
+            EXPECT_FALSE(bfdSessionExists(mon)) << "BFD session " << mon << " not removed";
     }
 }
