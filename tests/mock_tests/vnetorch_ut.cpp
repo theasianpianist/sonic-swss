@@ -203,6 +203,7 @@ namespace vnetorch_test
             sai_object_id_t vr = SAI_NULL_OBJECT_ID;
             sai_ip_prefix_t dest{};
             sai_object_id_t next_hop_id = SAI_NULL_OBJECT_ID;
+            int32_t packet_action = -1;
         };
         vector<NextHop> nexthops;
         vector<Group> groups;
@@ -815,6 +816,7 @@ namespace vnetorch_test
                         r.vr = e->vr_id;
                         r.dest = e->destination;
                         if (auto a = findRawAttr(l, n, SAI_ROUTE_ENTRY_ATTR_NEXT_HOP_ID)) r.next_hop_id = a->value.oid;
+                        if (auto a = findRawAttr(l, n, SAI_ROUTE_ENTRY_ATTR_PACKET_ACTION)) r.packet_action = a->value.s32;
                         m_rt.routes.push_back(r);
                     }
                     return st;
@@ -3513,5 +3515,58 @@ namespace vnetorch_test
         EXPECT_EQ(m_tun.removedTunnels.size(), 1U);
         EXPECT_EQ(m_tun.removedMaps.size(), 4U);
         EXPECT_EQ(m_tun.removedTerms.size(), 1U);
+    }
+
+    // A (non-default-scope) VNET VR gets an IPv6 link-local (fe80::/10) trap
+    // route installed at VR creation that forwards matched control packets to
+    // the CPU -- the mock equivalent of test_vnet_ip2me_link_local. RouteOrch's
+    // constructor installs these only for the default VR, so
+    // VNetVrfObject::createObj adds one per VNET VR (vnetorch.cpp:110) and its
+    // destructor removes it (vnetorch.cpp:361). The route is programmed with the
+    // real create_route_entry (captured in m_rt.routes), unlike VNET tunnel
+    // routes, so its vr/action/next-hop are directly assertable.
+    TEST_F(VNetOrchTest, VnetInstallsIpv6LinkLocalTrapRoute)
+    {
+        setVxlanTunnel("tunnel_ip2me", "10.10.10.10");
+        setVnet("Vnet_ip2me", "tunnel_ip2me", "20001", "");
+
+        const sai_object_id_t vnetVr = m_vrMock->created_oid;
+        ASSERT_NE(vnetVr, SAI_NULL_OBJECT_ID);
+        ASSERT_NE(vnetVr, gVirtualRouterId);
+
+        // Exactly one fe80::/10 route was programmed (the VS test asserts
+        // ll_prefixes == ["fe80::/10"]). The default-VR link-local routes
+        // RouteOrch installs during SetUp() predate the capture, so only the
+        // VNET VR's route is seen here.
+        const RouteCaptures::Route *ll = nullptr;
+        size_t llCount = 0;
+        for (const auto &r : m_rt.routes)
+        {
+            if (prefixAddrEquals(r.dest, "fe80::"))
+            {
+                llCount++;
+                ll = &r;
+            }
+        }
+        ASSERT_EQ(llCount, 1U);
+        // /10 mask: first 10 bits set -> 0xff 0xc0.
+        EXPECT_EQ(ll->dest.mask.ip6[0], 0xff);
+        EXPECT_EQ(ll->dest.mask.ip6[1], 0xc0);
+
+        // Programmed in the VNET's VR, not the default VR.
+        EXPECT_EQ(ll->vr, vnetVr);
+
+        // FORWARD-to-CPU: packet action FORWARD + next hop set to the CPU port.
+        EXPECT_EQ(ll->packet_action, SAI_PACKET_ACTION_FORWARD);
+        EXPECT_NE(ll->next_hop_id, SAI_NULL_OBJECT_ID);
+
+        // Deleting the VNET removes the link-local trap route.
+        delVnet("Vnet_ip2me");
+        bool removed = false;
+        for (const auto &d : m_rt.removedRoutes)
+            if (prefixAddrEquals(d, "fe80::")) removed = true;
+        EXPECT_TRUE(removed);
+
+        delVxlanTunnel("tunnel_ip2me");
     }
 }
