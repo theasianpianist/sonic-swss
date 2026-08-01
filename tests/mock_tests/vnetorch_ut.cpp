@@ -266,6 +266,145 @@ namespace vnetorch_test
         return g_savedSetRouteAttr(e, attr);
     }
 
+    // gRouteOrch programs VNET *local* routes through its route bulker, which
+    // copies the SAI create/remove_route_entries function pointers at
+    // construction time (bulker.h) -- i.e. before PostSetUp() can apply the SAI
+    // mock. So, like captureSetRouteEntryAttr above, these bulk entries are
+    // captured with a plain function-pointer trampoline installed early in
+    // ApplySaiMock() (before gRouteOrch is constructed) rather than via gmock.
+    static sai_status_t (*g_savedCreateRouteEntries)(
+        uint32_t, const sai_route_entry_t *, const uint32_t *,
+        const sai_attribute_t **, sai_bulk_op_error_mode_t, sai_status_t *) = nullptr;
+    static sai_status_t (*g_savedRemoveRouteEntries)(
+        uint32_t, const sai_route_entry_t *, sai_bulk_op_error_mode_t,
+        sai_status_t *) = nullptr;
+
+    static sai_status_t captureCreateRouteEntries(
+        uint32_t count, const sai_route_entry_t *entries, const uint32_t *attr_count,
+        const sai_attribute_t **attr_list, sai_bulk_op_error_mode_t mode,
+        sai_status_t *statuses)
+    {
+        sai_status_t st = g_savedCreateRouteEntries(count, entries, attr_count,
+                                                    attr_list, mode, statuses);
+        if (g_activeRouteCaptures)
+        {
+            for (uint32_t i = 0; i < count; ++i)
+            {
+                if (statuses[i] != SAI_STATUS_SUCCESS) continue;
+                RouteCaptures::Route r;
+                r.vr = entries[i].vr_id;
+                r.dest = entries[i].destination;
+                if (auto a = findRawAttr(attr_list[i], attr_count[i],
+                                         SAI_ROUTE_ENTRY_ATTR_NEXT_HOP_ID))
+                    r.next_hop_id = a->value.oid;
+                g_activeRouteCaptures->routes.push_back(r);
+            }
+        }
+        return st;
+    }
+
+    static sai_status_t captureRemoveRouteEntries(
+        uint32_t count, const sai_route_entry_t *entries,
+        sai_bulk_op_error_mode_t mode, sai_status_t *statuses)
+    {
+        sai_status_t st = g_savedRemoveRouteEntries(count, entries, mode, statuses);
+        if (g_activeRouteCaptures)
+        {
+            for (uint32_t i = 0; i < count; ++i)
+                if (statuses[i] == SAI_STATUS_SUCCESS)
+                    g_activeRouteCaptures->removedRoutes.push_back(entries[i].destination);
+        }
+        return st;
+    }
+
+    // The route bulker also binds set_route_entries_attribute at construction, so
+    // an in-place local-route repoint (NEXT_HOP_ID change when an ECMP endpoint
+    // set changes) flows through this bulk API rather than the single
+    // set_route_entry_attribute captureSetRouteEntryAttr intercepts. Trampoline it
+    // early too, updating the matching captured route's next_hop_id.
+    static sai_status_t (*g_savedSetRouteEntries)(
+        uint32_t, const sai_route_entry_t *, const sai_attribute_t *,
+        sai_bulk_op_error_mode_t, sai_status_t *) = nullptr;
+
+    static sai_status_t captureSetRouteEntries(
+        uint32_t count, const sai_route_entry_t *entries,
+        const sai_attribute_t *attr_list, sai_bulk_op_error_mode_t mode,
+        sai_status_t *statuses)
+    {
+        sai_status_t st = g_savedSetRouteEntries(count, entries, attr_list, mode, statuses);
+        if (g_activeRouteCaptures)
+        {
+            for (uint32_t i = 0; i < count; ++i)
+            {
+                if (attr_list[i].id != SAI_ROUTE_ENTRY_ATTR_NEXT_HOP_ID) continue;
+                for (auto &r : g_activeRouteCaptures->routes)
+                    if (r.vr == entries[i].vr_id &&
+                        saiIpPrefixEquals(r.dest, entries[i].destination))
+                        r.next_hop_id = attr_list[i].value.oid;
+            }
+        }
+        return st;
+    }
+
+    // gRouteOrch programs an ECMP local route's group members through its
+    // next-hop-group-member *object* bulker (gNextHopGroupMemberBulker), which --
+    // like the route bulker -- binds create/remove_next_hop_group_members at
+    // construction. Tunnel-route members go through VNetRouteOrch's single-object
+    // creates (captured by installRouteMock), but local ECMP members need the
+    // same early-trampoline treatment, installed in ApplySaiMock().
+    static sai_status_t (*g_savedCreateNhgMembers)(
+        sai_object_id_t, uint32_t, const uint32_t *, const sai_attribute_t **,
+        sai_bulk_op_error_mode_t, sai_object_id_t *, sai_status_t *) = nullptr;
+    static sai_status_t (*g_savedRemoveNhgMembers)(
+        uint32_t, const sai_object_id_t *, sai_bulk_op_error_mode_t,
+        sai_status_t *) = nullptr;
+
+    static sai_status_t captureCreateNhgMembers(
+        sai_object_id_t switch_id, uint32_t count, const uint32_t *attr_count,
+        const sai_attribute_t **attr_list, sai_bulk_op_error_mode_t mode,
+        sai_object_id_t *object_id, sai_status_t *statuses)
+    {
+        sai_status_t st = g_savedCreateNhgMembers(switch_id, count, attr_count,
+                                                  attr_list, mode, object_id, statuses);
+        if (g_activeRouteCaptures)
+        {
+            for (uint32_t i = 0; i < count; ++i)
+            {
+                if (statuses[i] != SAI_STATUS_SUCCESS) continue;
+                RouteCaptures::Member m;
+                m.oid = object_id[i];
+                if (auto a = findRawAttr(attr_list[i], attr_count[i],
+                                         SAI_NEXT_HOP_GROUP_MEMBER_ATTR_NEXT_HOP_GROUP_ID))
+                    m.nhg = a->value.oid;
+                if (auto a = findRawAttr(attr_list[i], attr_count[i],
+                                         SAI_NEXT_HOP_GROUP_MEMBER_ATTR_NEXT_HOP_ID))
+                    m.nh = a->value.oid;
+                if (auto a = findRawAttr(attr_list[i], attr_count[i],
+                                         SAI_NEXT_HOP_GROUP_MEMBER_ATTR_SEQUENCE_ID))
+                {
+                    m.has_seq = true;
+                    m.seq = a->value.u32;
+                }
+                g_activeRouteCaptures->members.push_back(m);
+            }
+        }
+        return st;
+    }
+
+    static sai_status_t captureRemoveNhgMembers(
+        uint32_t count, const sai_object_id_t *object_id,
+        sai_bulk_op_error_mode_t mode, sai_status_t *statuses)
+    {
+        sai_status_t st = g_savedRemoveNhgMembers(count, object_id, mode, statuses);
+        if (g_activeRouteCaptures)
+        {
+            for (uint32_t i = 0; i < count; ++i)
+                if (statuses[i] == SAI_STATUS_SUCCESS)
+                    g_activeRouteCaptures->removedMembers.push_back(object_id[i]);
+        }
+        return st;
+    }
+
     class VNetOrchTest : public MockOrchTest
     {
     protected:
@@ -320,6 +459,27 @@ namespace vnetorch_test
             // inflating the captured SAI object counts. Reset before each test.
             testing_db::reset();
             MockOrchTest::SetUp();
+        }
+
+        // Runs inside PrepareSai(), before any Orch (incl. gRouteOrch) is built.
+        // gRouteOrch's route bulker copies the SAI create/remove_route_entries
+        // function pointers at construction (bulker.h), so to capture the VNET
+        // *local* routes it programs in bulk we must install our trampolines on
+        // the real sai_route_api here -- PostSetUp() (where the gmock swap runs)
+        // is too late, as the bulker already holds the pre-mock pointers.
+        void ApplySaiMock() override
+        {
+            g_savedCreateRouteEntries = sai_route_api->create_route_entries;
+            g_savedRemoveRouteEntries = sai_route_api->remove_route_entries;
+            g_savedSetRouteEntries = sai_route_api->set_route_entries_attribute;
+            sai_route_api->create_route_entries = captureCreateRouteEntries;
+            sai_route_api->remove_route_entries = captureRemoveRouteEntries;
+            sai_route_api->set_route_entries_attribute = captureSetRouteEntries;
+
+            g_savedCreateNhgMembers = sai_next_hop_group_api->create_next_hop_group_members;
+            g_savedRemoveNhgMembers = sai_next_hop_group_api->remove_next_hop_group_members;
+            sai_next_hop_group_api->create_next_hop_group_members = captureCreateNhgMembers;
+            sai_next_hop_group_api->remove_next_hop_group_members = captureRemoveNhgMembers;
         }
 
         void ApplyInitialConfigs() override
@@ -422,6 +582,26 @@ namespace vnetorch_test
             g_activeRouteCaptures = nullptr;
             m_vrMock.reset();
             RestoreSaiApis();
+            // RestoreSaiApis() repointed sai_route_api back at the real struct
+            // the bulker trampolines were installed on in ApplySaiMock(); undo
+            // them so the next test re-saves the genuine libsaivs pointers (the
+            // struct is a process-global libsaivs singleton, reused every test).
+            if (g_savedCreateRouteEntries)
+            {
+                sai_route_api->create_route_entries = g_savedCreateRouteEntries;
+                sai_route_api->remove_route_entries = g_savedRemoveRouteEntries;
+                sai_route_api->set_route_entries_attribute = g_savedSetRouteEntries;
+                g_savedCreateRouteEntries = nullptr;
+                g_savedRemoveRouteEntries = nullptr;
+                g_savedSetRouteEntries = nullptr;
+            }
+            if (g_savedCreateNhgMembers)
+            {
+                sai_next_hop_group_api->create_next_hop_group_members = g_savedCreateNhgMembers;
+                sai_next_hop_group_api->remove_next_hop_group_members = g_savedRemoveNhgMembers;
+                g_savedCreateNhgMembers = nullptr;
+                g_savedRemoveNhgMembers = nullptr;
+            }
             DEINIT_SAI_API_MOCK(virtual_router);
             DEINIT_SAI_API_MOCK(next_hop);
             DEINIT_SAI_API_MOCK(next_hop_group);
@@ -548,7 +728,10 @@ namespace vnetorch_test
         // Capture the SAI next-hop / next-hop-group / route objects
         // VNetRouteOrch programs, calling through to real libsaivs so downstream
         // references (route -> next hop -> tunnel) resolve to valid OIDs.
-        // VNetRouteOrch uses the non-bulk single-object create calls.
+        // VNetRouteOrch programs tunnel routes via the non-bulk single-object
+        // create calls captured here; VNET *local* routes go through gRouteOrch's
+        // route bulker, whose bulk *_route_entries APIs are captured separately by
+        // the ApplySaiMock() trampolines (the bulker binds them before this runs).
         void installRouteMock()
         {
             ON_CALL(*mock_sai_next_hop_api, create_next_hop(_, _, _, _))
@@ -1372,6 +1555,131 @@ namespace vnetorch_test
                 EXPECT_NE(k.find(string(VNET_TUNNEL_TERM_ACL_TABLE) + ":"), 0U)
                     << "unexpected tunnel-term ACL rule " << k
                     << " before route creation";
+        }
+
+        // Bring a port oper-up by injecting a port_state_change SAI notification
+        // (the same channel syncd uses). Without this a fixture port stays
+        // oper-down, so NeighOrch stamps NHFLAGS_IFDOWN on next hops learned on it
+        // and RouteOrch refuses to program routes through them. Mock equivalent of
+        // the VS ports coming up once their carrier is set.
+        void setPortOperStatus(const string &port, sai_port_oper_status_t status)
+        {
+            Port p;
+            ASSERT_TRUE(gPortsOrch->getPort(port, p));
+
+            sai_port_oper_status_notification_t ntf{};
+            ntf.port_id = p.m_port_id;
+            ntf.port_state = status;
+            string data = sai_serialize_port_oper_status_ntf(1, &ntf);
+
+            vector<FieldValueTuple> notifyValues;
+            notifyValues.push_back(FieldValueTuple("port_state_change", data));
+            string msg = swss::JSon::buildJson(notifyValues);
+
+            mockReply = (redisReply *)calloc(1, sizeof(redisReply));
+            mockReply->type = REDIS_REPLY_ARRAY;
+            mockReply->elements = 3; // pattern-message reply: pattern, channel, payload
+            mockReply->element = (redisReply **)calloc(mockReply->elements, sizeof(redisReply *));
+            mockReply->element[2] = (redisReply *)calloc(1, sizeof(redisReply));
+            mockReply->element[2]->type = REDIS_REPLY_STRING;
+            mockReply->element[2]->str = (char *)calloc(1, msg.length() + 1);
+            memcpy(mockReply->element[2]->str, msg.c_str(), msg.length());
+
+            auto exec = static_cast<Notifier *>(gPortsOrch->getExecutor("PORT_STATUS_NOTIFICATIONS"));
+            auto consumer = exec->getNotificationConsumer();
+            consumer->readData();
+            static_cast<Orch *>(gPortsOrch)->doTask(*consumer);
+            mockReply = nullptr;
+        }
+
+        // Bind a router interface to a VNET, standing in for the VS
+        // create_phy_interface(): it writes CONFIG_DB INTERFACE with a vnet_name
+        // (mirrored to APP_DB INTF_TABLE by intfmgr) plus the interface IP.
+        // gIntfsOrch reads the vnet_name, resolves the VNET via gDirectory, and
+        // asks VNetOrch::setIntf() to create the RIF in the VNET's ingress VR
+        // (vnetorch.cpp) -- exactly the path a VNET-bound local route needs so
+        // its next hops resolve inside the VNET VR rather than the default VR.
+        void createVnetL3Interface(const string &port, const string &vnet,
+                                   const string &ipPrefix)
+        {
+            Table intfTable(m_app_db.get(), APP_INTF_TABLE_NAME);
+            intfTable.set(port, {{"vnet_name", vnet}});
+            intfTable.set(port + ":" + ipPrefix, {{"scope", "global"}, {"family", "IPv4"}});
+            gIntfsOrch->addExistingData(&intfTable);
+            static_cast<Orch *>(gIntfsOrch)->doTask();
+
+            // Bring the port up so neighbors learned on it produce programmable
+            // (non-IFDOWN) next hops.
+            setPortOperStatus(port, SAI_PORT_OPER_STATUS_UP);
+        }
+
+        // The VS test writes CONFIG_DB VNET_ROUTE (ifname + nexthop) and relies on
+        // VNetCfgRouteOrch to mirror it to APP_DB VNET_ROUTE_TABLE. The mock
+        // harness has no VNetCfgRouteOrch, so we write the APP_DB entry it would
+        // have produced (key "vnet:prefix"). A non-empty nexthop list makes this a
+        // VNET local route: VNetRouteOrch::handleRoutes() -> doRouteTask() builds
+        // an ip@ifname next-hop-group string and programs it through gRouteOrch,
+        // resolving each nexthop to the neighbor's SAI_NEXT_HOP_TYPE_IP next hop.
+        void setVnetLocalRoute(const string &vnet, const string &prefix,
+                               const string &ifnames, const string &nexthops)
+        {
+            vector<FieldValueTuple> fvs = {{"ifname", ifnames}, {"nexthop", nexthops}};
+            Table tbl(m_app_db.get(), APP_VNET_RT_TABLE_NAME);
+            tbl.set(vnet + ":" + prefix, fvs);
+            m_vnetRouteOrch->addExistingData(&tbl);
+            static_cast<Orch *>(m_vnetRouteOrch.get())->doTask();
+        }
+
+        void delVnetLocalRoute(const string &vnet, const string &prefix)
+        {
+            auto consumer = dynamic_cast<Consumer *>(
+                m_vnetRouteOrch->getExecutor(APP_VNET_RT_TABLE_NAME));
+            consumer->addToSync({{vnet + ":" + prefix, DEL_COMMAND, {}}});
+            static_cast<Orch *>(m_vnetRouteOrch.get())->doTask(*consumer);
+            Table tbl(m_app_db.get(), APP_VNET_RT_TABLE_NAME);
+            tbl.del(vnet + ":" + prefix);
+        }
+
+        // Assert a VNET local route's SAI programming --
+        // vnet_lib.check_vnet_local_routes() + check_vnet_local_route_nexthops().
+        // A single nexthop points the route directly at that neighbor's IP next
+        // hop; multiple nexthops point it at an (unordered) ECMP group whose
+        // members are exactly those neighbor IP next hops.
+        void checkVnetLocalRoute(const string &prefix, const vector<string> &nexthops)
+        {
+            const RouteCaptures::Route *r = findRoute(prefix.substr(0, prefix.find('/')));
+            ASSERT_NE(r, nullptr) << "no local route for prefix " << prefix;
+            if (nexthops.size() == 1)
+            {
+                bool found = false;
+                for (const auto &nh : m_rt.nexthops)
+                    if (nh.oid == r->next_hop_id && ipAddrEquals(nh.ip, nexthops[0]))
+                    {
+                        found = true;
+                        break;
+                    }
+                EXPECT_TRUE(found) << "local route " << prefix
+                                   << " not pointing at IP next hop for " << nexthops[0];
+            }
+            else
+            {
+                sai_object_id_t nhg = r->next_hop_id;
+                int32_t type = -1;
+                for (const auto &g : m_rt.groups)
+                    if (g.oid == nhg) type = g.type;
+                EXPECT_EQ(type, SAI_NEXT_HOP_GROUP_TYPE_ECMP)
+                    << "local ECMP route " << prefix << " group is not unordered ECMP";
+                EXPECT_EQ(activeMembers(nhg), nexthops.size());
+                for (size_t i = 0; i < nexthops.size(); i++)
+                    checkGroupMember(nhg, nexthops[i], false, (uint32_t)(i + 1));
+            }
+        }
+
+        // Assert a VNET local route is gone -- vnet_lib.check_del_vnet_local_routes().
+        void checkVnetLocalRouteRemoved(const string &prefix)
+        {
+            EXPECT_EQ(findRoute(prefix.substr(0, prefix.find('/'))), nullptr)
+                << "local route " << prefix << " not removed";
         }
     };
 
@@ -2999,5 +3307,59 @@ namespace vnetorch_test
         checkRouteNotAdvertised("100.100.1.0/24");
         for (const char *m : {"9.1.0.3", "9.1.0.4"})
             checkCustomMonitorDeleted("100.100.1.1/32", m);
+    }
+
+    // test_vnet_local_route_single: a VNET local route with a single directly-
+    // connected nexthop. The route is programmed inside the VNET's VR and points
+    // at the neighbor's IP next hop; deleting it removes the route.
+    TEST_F(VNetOrchTest, VnetLocalRouteSingle)
+    {
+        setVxlanTunnel("tunnel_30", "30.30.30.30");
+        setVnet("Vnet5000", "tunnel_30", "5000", "");
+
+        // VNET-bound RIF + directly-connected neighbor.
+        createVnetL3Interface("Ethernet20", "Vnet5000", "10.10.0.8/31");
+        addNeighbor("Ethernet20", "10.10.0.9", "00:01:02:03:04:05");
+
+        // Local route via the neighbor: route points directly at its IP next hop.
+        setVnetLocalRoute("Vnet5000", "10.10.0.0/24", "Ethernet20", "10.10.0.9");
+        checkVnetLocalRoute("10.10.0.0/24", {"10.10.0.9"});
+
+        // Delete removes the route.
+        delVnetLocalRoute("Vnet5000", "10.10.0.0/24");
+        checkVnetLocalRouteRemoved("10.10.0.0/24");
+    }
+
+    // test_vnet_local_route_ecmp: a VNET local route with multiple nexthops
+    // programs an unordered ECMP group; updating to a single nexthop collapses to
+    // a direct next hop, and back to ECMP re-expands the group.
+    TEST_F(VNetOrchTest, VnetLocalRouteEcmp)
+    {
+        setVxlanTunnel("tunnel_31", "31.31.31.31");
+        setVnet("Vnet5001", "tunnel_31", "5001", "");
+
+        // Two VNET-bound RIFs, each with a directly-connected neighbor.
+        createVnetL3Interface("Ethernet20", "Vnet5001", "10.10.0.8/31");
+        createVnetL3Interface("Ethernet16", "Vnet5001", "10.10.0.10/31");
+        addNeighbor("Ethernet20", "10.10.0.9", "00:01:02:03:04:05");
+        addNeighbor("Ethernet16", "10.10.0.11", "00:01:02:03:04:06");
+
+        // ECMP local route over both nexthops.
+        setVnetLocalRoute("Vnet5001", "10.10.0.0/24", "Ethernet20,Ethernet16",
+                          "10.10.0.9,10.10.0.11");
+        checkVnetLocalRoute("10.10.0.0/24", {"10.10.0.9", "10.10.0.11"});
+
+        // Update to a single nexthop: route points directly at that IP next hop.
+        setVnetLocalRoute("Vnet5001", "10.10.0.0/24", "Ethernet20", "10.10.0.9");
+        checkVnetLocalRoute("10.10.0.0/24", {"10.10.0.9"});
+
+        // Update back to ECMP.
+        setVnetLocalRoute("Vnet5001", "10.10.0.0/24", "Ethernet20,Ethernet16",
+                          "10.10.0.9,10.10.0.11");
+        checkVnetLocalRoute("10.10.0.0/24", {"10.10.0.9", "10.10.0.11"});
+
+        // Delete removes the route.
+        delVnetLocalRoute("Vnet5001", "10.10.0.0/24");
+        checkVnetLocalRouteRemoved("10.10.0.0/24");
     }
 }
