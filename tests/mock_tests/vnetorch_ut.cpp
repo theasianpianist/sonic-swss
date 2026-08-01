@@ -6,14 +6,21 @@
 #include "common/mock_test_helpers.h"
 #include "mock_table.h"
 #include "macaddress.h"
+#include "sai_serialize.h"
 
 #include <gtest/gtest.h>
 
 #include <algorithm>
 #include <cstring>
+#include <deque>
 #include <set>
 
 EXTERN_MOCK_FNS
+
+// Injected redis pub-sub reply used to drive gBfdOrch's BFD state-change
+// notification consumer, standing in for the ASIC_DB NOTIFICATIONS channel the
+// VS test writes with a NotificationProducer (vnet_lib.update_bfd_session_state).
+extern redisReply *mockReply;
 
 namespace vnetorch_test
 {
@@ -28,6 +35,11 @@ namespace vnetorch_test
     DEFINE_SAI_GENERIC_API_MOCK(next_hop, next_hop);
     DEFINE_SAI_GENERIC_APIS_MOCK(next_hop_group, next_hop_group, next_hop_group_member);
     DEFINE_SAI_API_MOCK_MATCH_ENTRY(route);
+    // gBfdOrch programs a SAI BFD session per endpoint monitor for a monitored
+    // VNET route (create/remove, no bulk ops). Default call-through to real
+    // libsaivs so the session gets a valid OID, which is also the id a
+    // bfd_session_state_change notification must carry.
+    DEFINE_SAI_GENERIC_API_MOCK(bfd, bfd_session);
 
     using namespace ::testing;
     using namespace std;
@@ -202,6 +214,18 @@ namespace vnetorch_test
         vector<sai_ip_prefix_t> removedRoutes;
     };
 
+    // Captured SAI BFD sessions gBfdOrch programs for a monitored VNET route's
+    // endpoint monitors -- the mock equivalent of vnet_lib.get_bfd_session_id(),
+    // which finds a session by its SAI_BFD_SESSION_ATTR_DST_IP_ADDRESS (the
+    // monitor address) with MULTIHOP=true. The OID is retained so a
+    // bfd_session_state_change notification can target the right session.
+    struct BfdCaptures
+    {
+        struct Session { sai_object_id_t oid = SAI_NULL_OBJECT_ID; sai_ip_address_t dst{}; };
+        vector<Session> sessions;
+        vector<sai_object_id_t> removed;
+    };
+
     // set_route_entry_attribute is not routed through the mock_sai_api framework
     // (its macro only mocks create/remove), yet VNetRouteOrch::update_route
     // repoints a route in place via this SET when an ECMP route's endpoint set
@@ -267,6 +291,20 @@ namespace vnetorch_test
         unique_ptr<VNetRouteOrch> m_vnetRouteOrch;
         RouteCaptures m_rt;
 
+        // BfdOrch::doTask() consults gDirectory for a BgpGlobalStateOrch and,
+        // when it is absent, defaults to *software* BFD -- programming STATE_DB
+        // instead of creating a SAI hardware session. orchdaemon always
+        // registers one, so the fixture does too (deleted in PreTearDown before
+        // gDirectory is cleared); with it present getSoftwareBfd() reports the
+        // switch's real (hardware) BFD-offload capability, matching the DVS.
+        BgpGlobalStateOrch *m_bgpGlobalStateOrch = nullptr;
+
+        // Captured BFD sessions + the APP_BFD_SESSION_TABLE keys already
+        // delivered to gBfdOrch, so syncBfd() can diff and deliver only new
+        // SETs / disappeared DELs.
+        BfdCaptures m_bfd;
+        set<string> m_deliveredBfdKeys;
+
         void SetUp() override
         {
             // gDB (the mock DB backing swss::Table) is process-global and is not
@@ -300,6 +338,7 @@ namespace vnetorch_test
             INIT_SAI_API_MOCK(next_hop);
             INIT_SAI_API_MOCK(next_hop_group);
             INIT_SAI_API_MOCK(route);
+            INIT_SAI_API_MOCK(bfd);
             MockSaiApis();
             m_vrMock = make_unique<VirtualRouterSaiMock>();
             // Record every virtual-router create (the VNET's, plus any the route
@@ -310,6 +349,15 @@ namespace vnetorch_test
 
             installTunnelMock();
             installRouteMock();
+            installBfdMock();
+
+            // BfdOrch::doTask() falls back to software BFD unless a
+            // BgpGlobalStateOrch is registered in gDirectory (see the member
+            // comment). Register one before gBfdOrch consumes anything so
+            // monitored routes drive real SAI BFD sessions.
+            m_bgpGlobalStateOrch = new BgpGlobalStateOrch(
+                m_config_db.get(), CFG_BGP_DEVICE_GLOBAL_TABLE_NAME);
+            gDirectory.set(m_bgpGlobalStateOrch);
 
             // VNetRouteOrch's ctor calls gBfdOrch->attach(this) with no null
             // guard, so gBfdOrch must exist first. VNetRouteOrch has no dtor of
@@ -345,6 +393,8 @@ namespace vnetorch_test
             gBfdOrch = nullptr;
             delete gTunneldecapOrch;
             gTunneldecapOrch = nullptr;
+            delete m_bgpGlobalStateOrch;
+            m_bgpGlobalStateOrch = nullptr;
 
             restoreTunnelMock();
             // Restore the route SET pointer before the mock framework swaps the
@@ -361,6 +411,7 @@ namespace vnetorch_test
             DEINIT_SAI_API_MOCK(next_hop);
             DEINIT_SAI_API_MOCK(next_hop_group);
             DEINIT_SAI_API_MOCK(route);
+            DEINIT_SAI_API_MOCK(bfd);
         }
 
         void installTunnelMock()
@@ -577,6 +628,31 @@ namespace vnetorch_test
             sai_route_api->set_route_entry_attribute = captureSetRouteEntryAttr;
         }
 
+        // Record the BFD sessions gBfdOrch creates/removes, keyed by the monitor
+        // (DST_IP) address the notification path later references, calling
+        // through to real libsaivs so each session gets a valid OID.
+        void installBfdMock()
+        {
+            ON_CALL(*mock_sai_bfd_api, create_bfd_session(_, _, _, _))
+                .WillByDefault(Invoke([this](sai_object_id_t *id, sai_object_id_t sw,
+                                             uint32_t n, const sai_attribute_t *l) {
+                    sai_status_t st = old_sai_bfd_api->create_bfd_session(id, sw, n, l);
+                    if (st == SAI_STATUS_SUCCESS)
+                    {
+                        BfdCaptures::Session s;
+                        s.oid = *id;
+                        if (auto a = findRawAttr(l, n, SAI_BFD_SESSION_ATTR_DST_IP_ADDRESS)) s.dst = a->value.ipaddr;
+                        m_bfd.sessions.push_back(s);
+                    }
+                    return st;
+                }));
+            ON_CALL(*mock_sai_bfd_api, remove_bfd_session(_))
+                .WillByDefault(Invoke([this](sai_object_id_t id) {
+                    m_bfd.removed.push_back(id);
+                    return old_sai_bfd_api->remove_bfd_session(id);
+                }));
+        }
+
         // The VS test writes VXLAN_TUNNEL / VNET to CONFIG_DB and relies on
         // vxlanmgr/vrfmgr to mirror them into APP_DB (vrfmgr passes the VNET
         // fields through unchanged). The mock harness has no cfgmgr daemons, so
@@ -641,6 +717,140 @@ namespace vnetorch_test
                 m_vnetRouteOrch->getExecutor(APP_VNET_RT_TUNNEL_TABLE_NAME));
             consumer->addToSync({{vnet + ":" + prefix, DEL_COMMAND, {}}});
             static_cast<Orch *>(m_vnetRouteOrch.get())->doTask(*consumer);
+        }
+
+        // A BFD-monitored VNET route: the VS test writes VNET_ROUTE_TUNNEL with
+        // endpoint + endpoint_monitor (ep_monitor). VNetRouteOrch pairs each
+        // endpoint with the monitor at the same list position, and (default BFD
+        // monitoring) writes an APP_BFD_SESSION_TABLE row per monitor via its
+        // producer. We then flush those rows into gBfdOrch (syncBfd) so the SAI
+        // BFD sessions are actually created, mirroring what libsaivs/syncd would
+        // have done in the VS test.
+        void setVnetRouteMonitored(const string &vnet, const string &prefix,
+                                   const string &endpoints, const string &monitors)
+        {
+            vector<FieldValueTuple> fvs = {{"endpoint", endpoints},
+                                           {"endpoint_monitor", monitors}};
+            Table tbl(m_app_db.get(), APP_VNET_RT_TUNNEL_TABLE_NAME);
+            tbl.set(vnet + ":" + prefix, fvs);
+            m_vnetRouteOrch->addExistingData(&tbl);
+            static_cast<Orch *>(m_vnetRouteOrch.get())->doTask();
+            syncBfd();
+        }
+
+        // Delete a monitored route, then flush the BFD session removals its
+        // teardown produced (removeBfdSession -> producer.del) into gBfdOrch.
+        void delVnetRouteMonitored(const string &vnet, const string &prefix)
+        {
+            delVnetRoute(vnet, prefix);
+            syncBfd();
+        }
+
+        // Deliver the APP_BFD_SESSION_TABLE changes VNetRouteOrch's producer made
+        // to gBfdOrch. VNetRouteOrch writes new sessions and .del()s removed ones
+        // straight into the mock DB, so we diff against what we delivered before:
+        // new keys -> SET (gBfdOrch creates the SAI session), disappeared keys ->
+        // DEL (gBfdOrch removes it). A plain table removal + addExistingData()
+        // would silently drop the DELs, so removals must flow as DEL_COMMAND.
+        void syncBfd()
+        {
+            Table tbl(m_app_db.get(), APP_BFD_SESSION_TABLE_NAME);
+            vector<string> keyList;
+            tbl.getKeys(keyList);
+            set<string> current(keyList.begin(), keyList.end());
+
+            deque<KeyOpFieldsValuesTuple> entries;
+            for (const auto &k : current)
+            {
+                if (m_deliveredBfdKeys.count(k)) continue;
+                vector<FieldValueTuple> fvs;
+                tbl.get(k, fvs);
+                entries.push_back({k, SET_COMMAND, fvs});
+            }
+            for (const auto &k : m_deliveredBfdKeys)
+            {
+                if (!current.count(k)) entries.push_back({k, DEL_COMMAND, {}});
+            }
+            m_deliveredBfdKeys = current;
+
+            if (entries.empty()) return;
+            auto consumer = dynamic_cast<Consumer *>(
+                gBfdOrch->getExecutor(APP_BFD_SESSION_TABLE_NAME));
+            consumer->addToSync(entries);
+            static_cast<Orch *>(gBfdOrch)->doTask(*consumer);
+        }
+
+        // The captured OID for the (still-existing) BFD session monitoring addr,
+        // or SAI_NULL_OBJECT_ID -- vnet_lib.get_bfd_session_id() equivalent.
+        sai_object_id_t bfdSessionOid(const string &addr) const
+        {
+            for (auto it = m_bfd.sessions.rbegin(); it != m_bfd.sessions.rend(); ++it)
+            {
+                if (ipAddrEquals(it->dst, addr) &&
+                    find(m_bfd.removed.begin(), m_bfd.removed.end(), it->oid) == m_bfd.removed.end())
+                {
+                    return it->oid;
+                }
+            }
+            return SAI_NULL_OBJECT_ID;
+        }
+
+        bool bfdSessionExists(const string &addr) const
+        {
+            return bfdSessionOid(addr) != SAI_NULL_OBJECT_ID;
+        }
+
+        // Inject a bfd_session_state_change notification for the session that
+        // monitors addr, standing in for vnet_lib.update_bfd_session_state()
+        // (which sends the same op on the ASIC_DB NOTIFICATIONS channel). gBfdOrch
+        // deserializes it, looks the OID up, and notifies VNetRouteOrch, which
+        // adds/removes the endpoint's group member synchronously.
+        void updateBfdSessionState(const string &addr, sai_bfd_session_state_t state)
+        {
+            sai_object_id_t oid = bfdSessionOid(addr);
+            ASSERT_NE(oid, SAI_NULL_OBJECT_ID) << "no BFD session for monitor " << addr;
+
+            sai_bfd_session_state_notification_t ntf{};
+            ntf.bfd_session_id = oid;
+            ntf.session_state = state;
+            string data = sai_serialize_bfd_session_state_ntf(1, &ntf);
+
+            vector<FieldValueTuple> notifyValues;
+            notifyValues.push_back(FieldValueTuple("bfd_session_state_change", data));
+            string msg = swss::JSon::buildJson(notifyValues);
+
+            mockReply = (redisReply *)calloc(1, sizeof(redisReply));
+            mockReply->type = REDIS_REPLY_ARRAY;
+            mockReply->elements = 3; // pattern-message reply: pattern, channel, payload
+            mockReply->element = (redisReply **)calloc(mockReply->elements, sizeof(redisReply *));
+            mockReply->element[2] = (redisReply *)calloc(1, sizeof(redisReply));
+            mockReply->element[2]->type = REDIS_REPLY_STRING;
+            mockReply->element[2]->str = (char *)calloc(1, msg.length() + 1);
+            memcpy(mockReply->element[2]->str, msg.c_str(), msg.length());
+
+            auto exec = static_cast<Notifier *>(gBfdOrch->getExecutor("BFD_STATE_NOTIFICATIONS"));
+            auto consumer = exec->getNotificationConsumer();
+            consumer->readData();
+            static_cast<Orch *>(gBfdOrch)->doTask(*consumer);
+            mockReply = nullptr;
+        }
+
+        // Members currently bound to nhg: created for this group and not since
+        // removed. VNetRouteOrch adds/removes members in place as BFD state
+        // changes, so this is the group's live member count.
+        size_t activeMembers(sai_object_id_t nhg) const
+        {
+            size_t n = 0;
+            for (const auto &m : m_rt.members)
+            {
+                if (m.nhg != nhg) continue;
+                if (find(m_rt.removedMembers.begin(), m_rt.removedMembers.end(), m.oid) ==
+                    m_rt.removedMembers.end())
+                {
+                    n++;
+                }
+            }
+            return n;
         }
 
         // Find the captured route for a host prefix (IPv4 or IPv6), skipping the
@@ -1077,5 +1287,194 @@ namespace vnetorch_test
         EXPECT_NE(find(m_rt.removedNexthops.begin(), m_rt.removedNexthops.end(), nhOid),
                   m_rt.removedNexthops.end());
         checkStateDbRouteRemoved("Vnet15", "fd:8:10::32/128");
+    }
+
+    // BFD-monitored ECMP VNET route lifecycle -- the mock equivalent of
+    // test_vnet_orch_9 (IPv4). With default BFD monitoring an endpoint only
+    // joins the route's group while its monitor's BFD session is UP:
+    //  * created with every session DOWN -> route not programmed, STATE_DB
+    //    inactive, but a BFD session exists per monitor;
+    //  * sessions UP -> route programmed over the ECMP group with one member
+    //    per UP endpoint, STATE_DB active with those endpoints;
+    //  * a session DOWN drops just that member; back UP re-adds it;
+    //  * all DOWN -> route removed, STATE_DB inactive, sessions still present;
+    //  * deleting the route removes the group and every BFD session.
+    TEST_F(VNetOrchTest, VnetMonitoredEcmpRouteFollowsBfdState)
+    {
+        setVxlanTunnel("tunnel_9", "9.9.9.9");
+        setVnet("Vnet9", "tunnel_9", "10009", "");
+
+        setVnetRouteMonitored("Vnet9", "100.100.1.1/32",
+                              "9.0.0.1,9.0.0.2,9.0.0.3", "9.1.0.1,9.1.0.2,9.1.0.3");
+
+        // Default BFD state is down: the route is not programmed and STATE_DB
+        // reports it inactive, but a BFD session exists for each monitor.
+        EXPECT_EQ(findRoute("100.100.1.1"), nullptr);
+        checkStateDbRoute("Vnet9", "100.100.1.1/32", "");
+        checkRouteNotAdvertised("100.100.1.1/32");
+        for (const char *mon : {"9.1.0.1", "9.1.0.2", "9.1.0.3"})
+            EXPECT_TRUE(bfdSessionExists(mon)) << "missing BFD session " << mon;
+
+        // All sessions up: the route is programmed over the ECMP group with a
+        // member per endpoint; STATE_DB lists all three active.
+        updateBfdSessionState("9.1.0.1", SAI_BFD_SESSION_STATE_UP);
+        updateBfdSessionState("9.1.0.2", SAI_BFD_SESSION_STATE_UP);
+        updateBfdSessionState("9.1.0.3", SAI_BFD_SESSION_STATE_UP);
+        const RouteCaptures::Route *r = findRoute("100.100.1.1");
+        ASSERT_NE(r, nullptr);
+        const sai_object_id_t nhg = r->next_hop_id;
+        EXPECT_NE(nhg, SAI_NULL_OBJECT_ID);
+        EXPECT_EQ(activeMembers(nhg), 3U);
+        checkStateDbRoute("Vnet9", "100.100.1.1/32", "9.0.0.1,9.0.0.2,9.0.0.3");
+        checkRouteNotAdvertised("100.100.1.1/32");
+
+        // One endpoint's session goes down: only that member is dropped.
+        updateBfdSessionState("9.1.0.2", SAI_BFD_SESSION_STATE_DOWN);
+        EXPECT_EQ(activeMembers(nhg), 2U);
+        checkStateDbRoute("Vnet9", "100.100.1.1/32", "9.0.0.1,9.0.0.3");
+
+        // Back up: the member is re-added, all three active again.
+        updateBfdSessionState("9.1.0.2", SAI_BFD_SESSION_STATE_UP);
+        EXPECT_EQ(activeMembers(nhg), 3U);
+        checkStateDbRoute("Vnet9", "100.100.1.1/32", "9.0.0.1,9.0.0.2,9.0.0.3");
+
+        // All endpoints down: the route is removed and STATE_DB goes inactive,
+        // but the BFD sessions remain (only route deletion removes them).
+        updateBfdSessionState("9.1.0.1", SAI_BFD_SESSION_STATE_DOWN);
+        updateBfdSessionState("9.1.0.2", SAI_BFD_SESSION_STATE_DOWN);
+        updateBfdSessionState("9.1.0.3", SAI_BFD_SESSION_STATE_DOWN);
+        EXPECT_EQ(activeMembers(nhg), 0U);
+        bool routeRemoved = false;
+        for (const auto &d : m_rt.removedRoutes)
+            if (prefixAddrEquals(d, "100.100.1.1")) routeRemoved = true;
+        EXPECT_TRUE(routeRemoved);
+        checkStateDbRoute("Vnet9", "100.100.1.1/32", "");
+        for (const char *mon : {"9.1.0.1", "9.1.0.2", "9.1.0.3"})
+            EXPECT_TRUE(bfdSessionExists(mon));
+
+        // Deleting the route removes the group, its STATE_DB entry, and the BFD
+        // sessions for all its monitors.
+        delVnetRouteMonitored("Vnet9", "100.100.1.1/32");
+        EXPECT_NE(find(m_rt.removedGroups.begin(), m_rt.removedGroups.end(), nhg),
+                  m_rt.removedGroups.end());
+        checkStateDbRouteRemoved("Vnet9", "100.100.1.1/32");
+        for (const char *mon : {"9.1.0.1", "9.1.0.2", "9.1.0.3"})
+            EXPECT_FALSE(bfdSessionExists(mon)) << "BFD session " << mon << " not removed";
+    }
+
+    // BFD-monitored IPv6 ECMP routes with two overlapping routes, a
+    // make-before-break group change, and shared/ref-counted BFD sessions --
+    // the mock equivalent of test_vnet_orch_10. Endpoint fd:10:1::N is paired
+    // (by list position) with monitor fd:10:2::N, so bringing monitor N up/down
+    // adds/drops endpoint N.
+    TEST_F(VNetOrchTest, VnetMonitoredEcmpRoutesIpv6Overlap)
+    {
+        setVxlanTunnel("tunnel_10", "fd:10::32");
+        setVnet("Vnet10", "tunnel_10", "10010", "");
+
+        // Route 1 over endpoints 1/2/3, all monitors down: not programmed.
+        setVnetRouteMonitored("Vnet10", "fd:10:10::1/128",
+                              "fd:10:1::1,fd:10:1::2,fd:10:1::3",
+                              "fd:10:2::1,fd:10:2::2,fd:10:2::3");
+        EXPECT_EQ(findRoute("fd:10:10::1"), nullptr);
+        checkStateDbRoute("Vnet10", "fd:10:10::1/128", "");
+        for (const char *mon : {"fd:10:2::1", "fd:10:2::2", "fd:10:2::3"})
+            EXPECT_TRUE(bfdSessionExists(mon)) << "missing BFD session " << mon;
+
+        // All three up: route 1 programmed over the group with three members.
+        updateBfdSessionState("fd:10:2::1", SAI_BFD_SESSION_STATE_UP);
+        updateBfdSessionState("fd:10:2::2", SAI_BFD_SESSION_STATE_UP);
+        updateBfdSessionState("fd:10:2::3", SAI_BFD_SESSION_STATE_UP);
+        const RouteCaptures::Route *r1 = findRoute("fd:10:10::1");
+        ASSERT_NE(r1, nullptr);
+        const sai_object_id_t nhg1 = r1->next_hop_id;
+        EXPECT_EQ(activeMembers(nhg1), 3U);
+        checkStateDbRoute("Vnet10", "fd:10:10::1/128",
+                          "fd:10:1::1,fd:10:1::2,fd:10:1::3");
+
+        // Endpoint 2's monitor goes down: dropped from route 1.
+        updateBfdSessionState("fd:10:2::2", SAI_BFD_SESSION_STATE_DOWN);
+        EXPECT_EQ(activeMembers(nhg1), 2U);
+        checkStateDbRoute("Vnet10", "fd:10:10::1/128", "fd:10:1::1,fd:10:1::3");
+
+        // Route 2 over endpoints 1/2/5 -- overlaps route 1 on 1/2 (whose BFD
+        // sessions are shared) and adds a new session for monitor 5. Only
+        // endpoint 1 is up, so route 2 starts with a single member.
+        setVnetRouteMonitored("Vnet10", "fd:10:20::1/128",
+                              "fd:10:1::1,fd:10:1::2,fd:10:1::5",
+                              "fd:10:2::1,fd:10:2::2,fd:10:2::5");
+        const RouteCaptures::Route *r2 = findRoute("fd:10:20::1");
+        ASSERT_NE(r2, nullptr);
+        const sai_object_id_t nhg2 = r2->next_hop_id;
+        EXPECT_EQ(activeMembers(nhg2), 1U);
+        checkStateDbRoute("Vnet10", "fd:10:20::1/128", "fd:10:1::1");
+        EXPECT_TRUE(bfdSessionExists("fd:10:2::5"));
+
+        // Endpoint 5 up: route 2 now has two members.
+        updateBfdSessionState("fd:10:2::5", SAI_BFD_SESSION_STATE_UP);
+        EXPECT_EQ(activeMembers(nhg2), 2U);
+        checkStateDbRoute("Vnet10", "fd:10:20::1/128", "fd:10:1::1,fd:10:1::5");
+
+        // Endpoint 3 down, endpoint 2 back up: route 1 -> {1,2} (same group).
+        updateBfdSessionState("fd:10:2::3", SAI_BFD_SESSION_STATE_DOWN);
+        updateBfdSessionState("fd:10:2::2", SAI_BFD_SESSION_STATE_UP);
+        EXPECT_EQ(activeMembers(nhg1), 2U);
+        checkStateDbRoute("Vnet10", "fd:10:10::1/128", "fd:10:1::1,fd:10:1::2");
+
+        // Make-before-break: change route 1's endpoint set to add endpoint 4.
+        // A new group is created (with the currently-up subset {1,2}); the route
+        // repoints to it and the old group is removed. Bringing endpoint 4 up
+        // then adds its member.
+        setVnetRouteMonitored("Vnet10", "fd:10:10::1/128",
+                              "fd:10:1::1,fd:10:1::2,fd:10:1::3,fd:10:1::4",
+                              "fd:10:2::1,fd:10:2::2,fd:10:2::3,fd:10:2::4");
+        updateBfdSessionState("fd:10:2::4", SAI_BFD_SESSION_STATE_UP);
+        const RouteCaptures::Route *r1b = findRoute("fd:10:10::1");
+        ASSERT_NE(r1b, nullptr);
+        const sai_object_id_t nhg1b = r1b->next_hop_id;
+        EXPECT_NE(nhg1b, nhg1);
+        EXPECT_NE(find(m_rt.removedGroups.begin(), m_rt.removedGroups.end(), nhg1),
+                  m_rt.removedGroups.end());
+        EXPECT_EQ(activeMembers(nhg1b), 3U);
+        checkStateDbRoute("Vnet10", "fd:10:10::1/128",
+                          "fd:10:1::1,fd:10:1::2,fd:10:1::4");
+
+        // Endpoint 3 back up: all four members active on the new group.
+        updateBfdSessionState("fd:10:2::3", SAI_BFD_SESSION_STATE_UP);
+        EXPECT_EQ(activeMembers(nhg1b), 4U);
+        checkStateDbRoute("Vnet10", "fd:10:10::1/128",
+                          "fd:10:1::1,fd:10:1::2,fd:10:1::3,fd:10:1::4");
+
+        // All of route 1's endpoints down: route 1 removed. Route 2 keeps only
+        // endpoint 5 (its monitors 1/2 are now down).
+        updateBfdSessionState("fd:10:2::1", SAI_BFD_SESSION_STATE_DOWN);
+        updateBfdSessionState("fd:10:2::2", SAI_BFD_SESSION_STATE_DOWN);
+        updateBfdSessionState("fd:10:2::3", SAI_BFD_SESSION_STATE_DOWN);
+        updateBfdSessionState("fd:10:2::4", SAI_BFD_SESSION_STATE_DOWN);
+        bool route1Removed = false;
+        for (const auto &d : m_rt.removedRoutes)
+            if (prefixAddrEquals(d, "fd:10:10::1")) route1Removed = true;
+        EXPECT_TRUE(route1Removed);
+        checkStateDbRoute("Vnet10", "fd:10:10::1/128", "");
+        EXPECT_EQ(activeMembers(nhg2), 1U);
+        checkStateDbRoute("Vnet10", "fd:10:20::1/128", "fd:10:1::5");
+
+        // Delete route 2: its group is removed and only its unique BFD session
+        // (monitor 5) is torn down -- monitors 1-4 are still held by route 1.
+        delVnetRouteMonitored("Vnet10", "fd:10:20::1/128");
+        EXPECT_NE(find(m_rt.removedGroups.begin(), m_rt.removedGroups.end(), nhg2),
+                  m_rt.removedGroups.end());
+        checkStateDbRouteRemoved("Vnet10", "fd:10:20::1/128");
+        EXPECT_FALSE(bfdSessionExists("fd:10:2::5"));
+        for (const char *mon : {"fd:10:2::1", "fd:10:2::2", "fd:10:2::3", "fd:10:2::4"})
+            EXPECT_TRUE(bfdSessionExists(mon)) << "BFD session " << mon << " removed too early";
+
+        // Delete route 1: the new group and all its remaining BFD sessions go.
+        delVnetRouteMonitored("Vnet10", "fd:10:10::1/128");
+        EXPECT_NE(find(m_rt.removedGroups.begin(), m_rt.removedGroups.end(), nhg1b),
+                  m_rt.removedGroups.end());
+        checkStateDbRouteRemoved("Vnet10", "fd:10:10::1/128");
+        for (const char *mon : {"fd:10:2::1", "fd:10:2::2", "fd:10:2::3", "fd:10:2::4"})
+            EXPECT_FALSE(bfdSessionExists(mon)) << "BFD session " << mon << " not removed";
     }
 }
