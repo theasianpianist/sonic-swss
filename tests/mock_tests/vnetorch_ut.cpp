@@ -883,12 +883,13 @@ namespace vnetorch_test
 
         void setVnet(const string &name, const string &tunnel, const string &vni,
                      const string &peer_list, bool advertise_prefix = false,
-                     const string &overlay_dmac = "")
+                     const string &overlay_dmac = "", const string &scope = "")
         {
             vector<FieldValueTuple> fvs = {{"vxlan_tunnel", tunnel}, {"vni", vni},
                                            {"peer_list", peer_list}};
             if (advertise_prefix) fvs.push_back({"advertise_prefix", "true"});
             if (!overlay_dmac.empty()) fvs.push_back({"overlay_dmac", overlay_dmac});
+            if (!scope.empty()) fvs.push_back({"scope", scope});
             Table tbl(m_app_db.get(), APP_VNET_TABLE_NAME);
             tbl.set(name, fvs);
             m_vnetOrch->addExistingData(&tbl);
@@ -3466,5 +3467,51 @@ namespace vnetorch_test
         checkStateDbRouteRemoved("Vnet25", "125.100.1.1/32");
         for (const char *mon : {"9.1.0.1", "9.1.0.2", "9.1.0.3"})
             EXPECT_FALSE(bfdSessionExists(mon)) << "BFD session " << mon << " not removed";
+    }
+
+    // A default-scope VNET (scope=default) reuses the global default virtual
+    // router instead of creating a per-VNET one -- the mock equivalent of
+    // test_vnet_orch_5 / vnet_lib.check_default_vnet_entry (which asserts no new
+    // SAI_OBJECT_TYPE_VIRTUAL_ROUTER is created). The VXLAN tunnel is still
+    // programmed and its VR<->VNI tunnel-map entries are keyed by the default
+    // VR (gVirtualRouterId), and deleting the VNET removes neither the default
+    // VR nor recreates one.
+    TEST_F(VNetOrchTest, VnetDefaultScopeReusesDefaultVirtualRouter)
+    {
+        // A default-scope VNET must not create or remove a virtual router.
+        EXPECT_CALL(*mock_sai_virtual_router_api, create_virtual_router).Times(0);
+        EXPECT_CALL(*mock_sai_virtual_router_api, remove_virtual_router).Times(0);
+
+        setVxlanTunnel("tunnel_5", "8.8.8.8");
+        setVnet("Vnet_5", "tunnel_5", "4789", "", false, "", "default");
+
+        // The tunnel is still fully programmed (one tunnel, four maps, one term).
+        ASSERT_EQ(m_tun.tunnels.size(), 1U);
+        ASSERT_EQ(m_tun.maps.size(), 4U);
+        ASSERT_EQ(m_tun.terms.size(), 1U);
+
+        // The two VR<->VNI map entries carry the VNI and are keyed by the default
+        // VR (the mock equivalent of check_vxlan_tunnel_entry against the default
+        // VNET's default-VR mapper).
+        ASSERT_EQ(m_tun.mapEntries.size(), 2U);
+        const auto &e0 = m_tun.mapEntries[0];
+        EXPECT_EQ(e0.map_type, SAI_TUNNEL_MAP_TYPE_VIRTUAL_ROUTER_ID_TO_VNI);
+        EXPECT_EQ(e0.vr_key, gVirtualRouterId);
+        EXPECT_EQ(e0.vni_value, 4789U);
+        const auto &e1 = m_tun.mapEntries[1];
+        EXPECT_EQ(e1.map_type, SAI_TUNNEL_MAP_TYPE_VNI_TO_VIRTUAL_ROUTER_ID);
+        EXPECT_EQ(e1.vni_key, 4789U);
+        EXPECT_EQ(e1.vr_value, gVirtualRouterId);
+
+        // Deleting the VNET removes its two map entries but not the default VR
+        // (the Times(0) on remove_virtual_router above), and deleting the tunnel
+        // tears down the shared tunnel/maps/term.
+        delVnet("Vnet_5");
+        EXPECT_EQ(m_tun.removedMapEntries.size(), 2U);
+
+        delVxlanTunnel("tunnel_5");
+        EXPECT_EQ(m_tun.removedTunnels.size(), 1U);
+        EXPECT_EQ(m_tun.removedMaps.size(), 4U);
+        EXPECT_EQ(m_tun.removedTerms.size(), 1U);
     }
 }
