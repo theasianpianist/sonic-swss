@@ -437,6 +437,16 @@ namespace vnetorch_test
         // routes are driven entirely through this path.
         unique_ptr<MonitorOrch> m_monitorOrch;
 
+        // Consumes STATE_DB BFD_SESSION_TABLE (which gBfdOrch mirrors each BFD
+        // session state into) and forwards every up/down to VNetRouteOrch's
+        // updateCustomBfdState(), exactly as orchdaemon's gBfdMonitorOrch does.
+        // custom_bfd-monitored routes react ONLY through this path: the SAI
+        // notification observer (VNetRouteOrch::updateVnetTunnel) explicitly
+        // skips custom_bfd sessions (vnetorch.cpp), so a bfd_session_state_change
+        // alone never activates them -- BfdMonitorOrch must consume the STATE_DB
+        // row gBfdOrch writes.
+        unique_ptr<BfdMonitorOrch> m_bfdMonitorOrch;
+
         // BfdOrch::doTask() consults gDirectory for a BgpGlobalStateOrch and,
         // when it is absent, defaults to *software* BFD -- programming STATE_DB
         // instead of creating a SAI hardware session. orchdaemon always
@@ -562,12 +572,19 @@ namespace vnetorch_test
             gDirectory.set(m_vnetRouteOrch.get());
             m_monitorOrch = make_unique<MonitorOrch>(
                 m_state_db.get(), STATE_VNET_MONITOR_TABLE_NAME);
+
+            // custom_bfd routes are driven off STATE_DB BFD_SESSION_TABLE (see
+            // the member comment). It resolves VNetRouteOrch via gDirectory
+            // (already set above), so no registration of its own is needed.
+            m_bfdMonitorOrch = make_unique<BfdMonitorOrch>(
+                m_state_db.get(), STATE_BFD_SESSION_TABLE_NAME);
         }
 
         void PreTearDown() override
         {
             // Tear the route orch down before gBfdOrch: it attached to gBfdOrch
             // in its ctor and relies on gBfdOrch staying alive until it is gone.
+            m_bfdMonitorOrch.reset();
             m_monitorOrch.reset();
             m_vnetRouteOrch.reset();
             delete gBfdOrch;
@@ -994,7 +1011,10 @@ namespace vnetorch_test
                                   const string &monitoring = "custom",
                                   const string &adv_prefix = "",
                                   const string &profile = "",
-                                  bool check_directly_connected = false)
+                                  bool check_directly_connected = false,
+                                  int rx_monitor_timer = -1,
+                                  int tx_monitor_timer = -1,
+                                  const string &pinned_state = "")
         {
             vector<FieldValueTuple> fvs = {{"endpoint", endpoints},
                                            {"endpoint_monitor", monitors},
@@ -1003,6 +1023,9 @@ namespace vnetorch_test
             if (!adv_prefix.empty()) fvs.push_back({"adv_prefix", adv_prefix});
             if (!profile.empty()) fvs.push_back({"profile", profile});
             if (check_directly_connected) fvs.push_back({"check_directly_connected", "true"});
+            if (rx_monitor_timer >= 0) fvs.push_back({"rx_monitor_timer", to_string(rx_monitor_timer)});
+            if (tx_monitor_timer >= 0) fvs.push_back({"tx_monitor_timer", to_string(tx_monitor_timer)});
+            if (!pinned_state.empty()) fvs.push_back({"pinned_state", pinned_state});
             Table tbl(m_app_db.get(), APP_VNET_RT_TUNNEL_TABLE_NAME);
             tbl.set(vnet + ":" + prefix, fvs);
             m_vnetRouteOrch->addExistingData(&tbl);
@@ -1174,6 +1197,15 @@ namespace vnetorch_test
             consumer->readData();
             static_cast<Orch *>(gBfdOrch)->doTask(*consumer);
             mockReply = nullptr;
+
+            // gBfdOrch mirrored the new state into STATE_DB BFD_SESSION_TABLE. On
+            // a real switch a keyspace notification wakes gBfdMonitorOrch, which
+            // drives the custom_bfd monitor state; drive it here so custom_bfd
+            // routes react. For plain-BFD routes there is no monitor_info_ entry,
+            // so updateCustomBfdState() returns early -- a harmless no-op.
+            Table bfdStateTbl(m_state_db.get(), STATE_BFD_SESSION_TABLE_NAME);
+            m_bfdMonitorOrch->addExistingData(&bfdStateTbl);
+            static_cast<Orch *>(m_bfdMonitorOrch.get())->doTask();
         }
 
         // Enable/disable Traffic-Shift-Away, the mock equivalent of vnet_lib
@@ -3455,6 +3487,213 @@ namespace vnetorch_test
 
         delVnet("Vnet_local_ep");
         delVxlanTunnel("tunnel_local_ep");
+    }
+
+    // Mock equivalent of test_vnet_orch_34: a custom_bfd priority route whose
+    // primary is a directly-connected local endpoint. The route is re-paired on
+    // the fly (endpoint set + primary changed): the BFD session for the dropped
+    // remote endpoint is torn down, the route falls back to the still-up
+    // secondary while the new primary's monitor is down, and switches to the new
+    // primary once its BFD comes up. Advertisement follows the active state.
+    TEST_F(VNetOrchTest, VnetCustomBfdPriorityRouteRepairing)
+    {
+        setVxlanTunnel("tunnel_34", "9.9.9.9");
+        setVnet("vnet34", "tunnel_34", "10029", "", /*advertise_prefix=*/true,
+                /*overlay_dmac=*/"22:33:33:44:44:66");
+
+        // 9.1.0.1 is a directly-connected local endpoint on Ethernet4 (/32).
+        createL3Interface("Ethernet4", "9.1.0.1/32");
+        addNeighbor("Ethernet4", "9.1.0.1", "00:01:02:03:04:05");
+
+        // Priority route: primary 9.1.0.1 (local), secondary 9.1.0.2 (remote),
+        // custom_bfd monitoring with per-endpoint monitor timers.
+        setVnetRoutePriority("vnet34", "100.100.1.1/32", "9.1.0.1,9.1.0.2",
+                             "9.1.0.1,9.1.0.2", /*primary=*/"9.1.0.1",
+                             /*monitoring=*/"custom_bfd",
+                             /*adv_prefix=*/"100.100.1.1/32", /*profile=*/"",
+                             /*check_directly_connected=*/true,
+                             /*rx_monitor_timer=*/100, /*tx_monitor_timer=*/100);
+
+        // Default monitor state is down -> route not programmed (ASIC), present
+        // in STATE_DB but inactive, not advertised.
+        EXPECT_EQ(findRoute("100.100.1.1"), nullptr);
+        checkStateDbRoute("vnet34", "100.100.1.1/32", "");
+        checkRouteNotAdvertised("100.100.1.1/32");
+
+        // Both monitors up -> only the primary 9.1.0.1 is in use.
+        updateBfdSessionState("9.1.0.1", SAI_BFD_SESSION_STATE_UP);
+        updateBfdSessionState("9.1.0.2", SAI_BFD_SESSION_STATE_UP);
+        checkPriorityRoute("100.100.1.1", {"9.1.0.1"});
+        checkStateDbRoute("vnet34", "100.100.1.1/32", "9.1.0.1");
+        checkRouteAdvertised("100.100.1.1/32");
+
+        // Re-pair: swap the secondary 9.1.0.2 -> 9.1.0.3 and make it primary.
+        setVnetRoutePriority("vnet34", "100.100.1.1/32", "9.1.0.1,9.1.0.3",
+                             "9.1.0.1,9.1.0.3", /*primary=*/"9.1.0.3",
+                             "custom_bfd", "100.100.1.1/32", "", true, 100, 100);
+
+        // The dropped remote endpoint's BFD session is gone; the new primary
+        // 9.1.0.3 is still down, so the route falls back to the up secondary.
+        EXPECT_FALSE(bfdSessionExists("9.1.0.2"));
+        checkStateDbRoute("vnet34", "100.100.1.1/32", "9.1.0.1");
+
+        // New primary up -> route switches to 9.1.0.3.
+        updateBfdSessionState("9.1.0.3", SAI_BFD_SESSION_STATE_UP);
+        checkPriorityRoute("100.100.1.1", {"9.1.0.3"});
+        checkStateDbRoute("vnet34", "100.100.1.1/32", "9.1.0.3");
+        checkRouteAdvertised("100.100.1.1/32");
+
+        // Delete: route withdrawn, advertisement removed, all sessions gone.
+        delVnetRouteMonitored("vnet34", "100.100.1.1/32");
+        checkStateDbRouteRemoved("vnet34", "100.100.1.1/32");
+        checkRouteNotAdvertised("100.100.1.1/32");
+        EXPECT_FALSE(bfdSessionExists("9.1.0.1"));
+        EXPECT_FALSE(bfdSessionExists("9.1.0.3"));
+
+        delVnet("vnet34");
+        delVxlanTunnel("tunnel_34");
+    }
+
+    // Mock equivalent of test_vnet_orch_35 (DPU repair under the same NPU): the
+    // endpoint set is unchanged, but the *monitor* IP paired with the remote
+    // endpoint is re-pointed several times (10.1.0.1 -> 10.1.0.2 -> 10.1.0.3 ->
+    // 10.1.0.1). Each re-pair tears down the old monitor's BFD session and
+    // creates one for the new monitor; the active endpoint follows the primary.
+    TEST_F(VNetOrchTest, VnetCustomBfdMonitorRepairSameNpu)
+    {
+        setVxlanTunnel("tunnel_35", "9.9.9.9");
+        setVnet("vnet35", "tunnel_35", "10029", "", /*advertise_prefix=*/true,
+                /*overlay_dmac=*/"22:33:33:44:44:66");
+
+        createL3Interface("Ethernet4", "9.1.0.1/32");
+        addNeighbor("Ethernet4", "9.1.0.1", "00:01:02:03:04:05");
+
+        // endpoints 9.1.0.1 (local) + 9.1.0.2 (remote); the remote endpoint is
+        // monitored through a separate DPU monitor IP 10.1.0.1.
+        setVnetRoutePriority("vnet35", "100.100.1.1/32", "9.1.0.1,9.1.0.2",
+                             "9.1.0.1,10.1.0.1", /*primary=*/"9.1.0.1",
+                             "custom_bfd", "100.100.1.1/32", "", true, 100, 100);
+        EXPECT_EQ(findRoute("100.100.1.1"), nullptr);
+        checkStateDbRoute("vnet35", "100.100.1.1/32", "");
+        checkRouteNotAdvertised("100.100.1.1/32");
+
+        updateBfdSessionState("9.1.0.1", SAI_BFD_SESSION_STATE_UP);
+        updateBfdSessionState("10.1.0.1", SAI_BFD_SESSION_STATE_UP);
+        checkPriorityRoute("100.100.1.1", {"9.1.0.1"});
+        checkStateDbRoute("vnet35", "100.100.1.1/32", "9.1.0.1");
+        checkRouteAdvertised("100.100.1.1/32");
+
+        // Re-point the remote monitor 10.1.0.1 -> 10.1.0.2 (endpoints unchanged).
+        setVnetRoutePriority("vnet35", "100.100.1.1/32", "9.1.0.1,9.1.0.2",
+                             "9.1.0.1,10.1.0.2", /*primary=*/"9.1.0.1",
+                             "custom_bfd", "100.100.1.1/32", "", true, 100, 100);
+        EXPECT_FALSE(bfdSessionExists("10.1.0.1"));
+        checkStateDbRoute("vnet35", "100.100.1.1/32", "9.1.0.1");
+        updateBfdSessionState("10.1.0.2", SAI_BFD_SESSION_STATE_UP);
+        checkPriorityRoute("100.100.1.1", {"9.1.0.1"});
+        checkStateDbRoute("vnet35", "100.100.1.1/32", "9.1.0.1");
+        checkRouteAdvertised("100.100.1.1/32");
+
+        // Re-point monitor 10.1.0.2 -> 10.1.0.3 and make the remote endpoint
+        // primary: while 10.1.0.3 is down the route stays on the local 9.1.0.1.
+        setVnetRoutePriority("vnet35", "100.100.1.1/32", "9.1.0.1,9.1.0.2",
+                             "9.1.0.1,10.1.0.3", /*primary=*/"9.1.0.2",
+                             "custom_bfd", "100.100.1.1/32", "", true, 100, 100);
+        EXPECT_FALSE(bfdSessionExists("10.1.0.2"));
+        checkStateDbRoute("vnet35", "100.100.1.1/32", "9.1.0.1");
+        updateBfdSessionState("10.1.0.3", SAI_BFD_SESSION_STATE_UP);
+        checkPriorityRoute("100.100.1.1", {"9.1.0.2"});
+        checkStateDbRoute("vnet35", "100.100.1.1/32", "9.1.0.2");
+        checkRouteAdvertised("100.100.1.1/32");
+
+        // Re-pair back to the original monitor + primary.
+        setVnetRoutePriority("vnet35", "100.100.1.1/32", "9.1.0.1,9.1.0.2",
+                             "9.1.0.1,10.1.0.1", /*primary=*/"9.1.0.1",
+                             "custom_bfd", "100.100.1.1/32", "", true, 100, 100);
+        EXPECT_FALSE(bfdSessionExists("10.1.0.3"));
+        checkStateDbRoute("vnet35", "100.100.1.1/32", "9.1.0.1");
+        updateBfdSessionState("10.1.0.1", SAI_BFD_SESSION_STATE_UP);
+        checkPriorityRoute("100.100.1.1", {"9.1.0.1"});
+        checkStateDbRoute("vnet35", "100.100.1.1/32", "9.1.0.1");
+        checkRouteAdvertised("100.100.1.1/32");
+
+        delVnetRouteMonitored("vnet35", "100.100.1.1/32");
+        checkStateDbRouteRemoved("vnet35", "100.100.1.1/32");
+        checkRouteNotAdvertised("100.100.1.1/32");
+        EXPECT_FALSE(bfdSessionExists("9.1.0.1"));
+        EXPECT_FALSE(bfdSessionExists("10.1.0.1"));
+
+        delVnet("vnet35");
+        delVxlanTunnel("tunnel_35");
+    }
+
+    // Mock equivalent of test_vnet_orch_36 (pinned monitor state): a custom_bfd
+    // priority route whose primary monitor's *pinned* state overrides the actual
+    // BFD state. Pinning the primary down forces failover to the backup even
+    // though its BFD is up; pinning it up keeps the route on the primary even
+    // when the primary's BFD goes down.
+    TEST_F(VNetOrchTest, VnetCustomBfdPinnedMonitorState)
+    {
+        setVxlanTunnel("tunnel_36", "9.9.9.9");
+        setVnet("vnet36", "tunnel_36", "10029", "", /*advertise_prefix=*/true,
+                /*overlay_dmac=*/"22:33:33:44:44:66");
+
+        createL3Interface("Ethernet4", "9.1.0.1/32");
+        addNeighbor("Ethernet4", "9.1.0.1", "00:01:02:03:04:05");
+
+        // Primary 9.1.0.1 (local DPU), backup 10.1.0.1 (remote NPU) monitored
+        // through DPU 9.1.0.2; no pins initially.
+        setVnetRoutePriority("vnet36", "100.100.1.1/32", "9.1.0.1,10.1.0.1",
+                             "9.1.0.1,9.1.0.2", /*primary=*/"9.1.0.1",
+                             "custom_bfd", "100.100.1.1/32", "", true, 100, 100,
+                             /*pinned_state=*/"none,none");
+        EXPECT_EQ(findRoute("100.100.1.1"), nullptr);
+        checkStateDbRoute("vnet36", "100.100.1.1/32", "");
+        checkRouteNotAdvertised("100.100.1.1/32");
+
+        updateBfdSessionState("9.1.0.1", SAI_BFD_SESSION_STATE_UP);
+        updateBfdSessionState("9.1.0.2", SAI_BFD_SESSION_STATE_UP);
+        checkPriorityRoute("100.100.1.1", {"9.1.0.1"});
+        checkStateDbRoute("vnet36", "100.100.1.1/32", "9.1.0.1");
+        checkRouteAdvertised("100.100.1.1/32");
+
+        // Pin the primary monitor down -> route fails over to the backup even
+        // though the primary's BFD is still up.
+        setVnetRoutePriority("vnet36", "100.100.1.1/32", "9.1.0.1,10.1.0.1",
+                             "9.1.0.1,9.1.0.2", /*primary=*/"9.1.0.1",
+                             "custom_bfd", "", "", false, -1, -1,
+                             /*pinned_state=*/"down,none");
+        checkPriorityRoute("100.100.1.1", {"10.1.0.1"});
+        checkStateDbRoute("vnet36", "100.100.1.1/32", "10.1.0.1");
+        checkRouteAdvertised("100.100.1.1/32");
+
+        // Un-pin -> back to the primary.
+        setVnetRoutePriority("vnet36", "100.100.1.1/32", "9.1.0.1,10.1.0.1",
+                             "9.1.0.1,9.1.0.2", /*primary=*/"9.1.0.1",
+                             "custom_bfd", "", "", false, -1, -1,
+                             /*pinned_state=*/"none,none");
+        checkPriorityRoute("100.100.1.1", {"9.1.0.1"});
+        checkStateDbRoute("vnet36", "100.100.1.1/32", "9.1.0.1");
+        checkRouteAdvertised("100.100.1.1/32");
+
+        // Pin the primary up, then drop its BFD: the route stays on the primary.
+        setVnetRoutePriority("vnet36", "100.100.1.1/32", "9.1.0.1,10.1.0.1",
+                             "9.1.0.1,9.1.0.2", /*primary=*/"9.1.0.1",
+                             "custom_bfd", "", "", false, -1, -1,
+                             /*pinned_state=*/"up,none");
+        updateBfdSessionState("9.1.0.1", SAI_BFD_SESSION_STATE_DOWN);
+        checkPriorityRoute("100.100.1.1", {"9.1.0.1"});
+        checkStateDbRoute("vnet36", "100.100.1.1/32", "9.1.0.1");
+        checkRouteAdvertised("100.100.1.1/32");
+
+        delVnetRouteMonitored("vnet36", "100.100.1.1/32");
+        checkStateDbRouteRemoved("vnet36", "100.100.1.1/32");
+        checkRouteNotAdvertised("100.100.1.1/32");
+        EXPECT_FALSE(bfdSessionExists("9.1.0.1"));
+        EXPECT_FALSE(bfdSessionExists("9.1.0.2"));
+
+        delVnet("vnet36");
+        delVxlanTunnel("tunnel_36");
     }
 
     // BFD-monitored ECMP VNET route through a Traffic-Shift-Away cycle -- the
