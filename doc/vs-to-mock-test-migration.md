@@ -46,9 +46,9 @@ The VS test stage is the pipeline's critical path - it's 68.9% of total wall-clo
 
 Longest-running files (avg per build, retries included) - this is what drives the migration order in section 9. The `Portable?` column is the section 6 / section 7 classification, since that's what decides whether a given cost is actually ours to reclaim.
 
-| File | Avg / build | Flaky builds (of 40) | Portable? |
-|------|------------:|---------------------:|-----------|
-| test_vnet | 52.5 min | 365 occ. | Yes |
+| File | Avg / build | Flaky occurrences (across 40 runs) | Portable? |
+|------|------------:|----------------------------------:|-----------|
+| test_vnet | 52.5 min | 365 | Yes |
 | test_fabric_port_isolation | 40.4 min | 13 | Yes |
 | test_virtual_chassis | 34.9 min | 22 | No - kept |
 | test_fabric_capacity | 29.8 min | 0 | Yes |
