@@ -4,8 +4,14 @@
 #include "mock_sai_tunnel.h"
 #include "mock_orch_test.h"
 #include "common/mock_test_helpers.h"
+#include "mock_table.h"
+#include "macaddress.h"
 
 #include <gtest/gtest.h>
+
+#include <algorithm>
+#include <cstring>
+#include <set>
 
 EXTERN_MOCK_FNS
 
@@ -15,6 +21,13 @@ namespace vnetorch_test
     // create/set/remove with no bulk ops, so the WITH_SET generic mock variant
     // fits (same shape as sai_policer_api).
     DEFINE_SAI_GENERIC_API_MOCK_WITH_SET(virtual_router, virtual_router);
+    // VNetRouteOrch programs tunnel routes with non-bulk single-object SAI
+    // calls, so the plain generic mocks fit (next hop, next hop group + members,
+    // and the route entry). All default to call-through to real libsaivs so the
+    // route -> next hop -> tunnel object references resolve to valid OIDs.
+    DEFINE_SAI_GENERIC_API_MOCK(next_hop, next_hop);
+    DEFINE_SAI_GENERIC_APIS_MOCK(next_hop_group, next_hop_group, next_hop_group_member);
+    DEFINE_SAI_API_MOCK_MATCH_ENTRY(route);
 
     using namespace ::testing;
     using namespace std;
@@ -81,6 +94,19 @@ namespace vnetorch_test
                a.addr.ip4 == expected.getV4Addr();
     }
 
+    static bool saiMacEquals(const sai_mac_t &m, const string &mac)
+    {
+        swss::MacAddress expected(mac);
+        return memcmp(m, expected.getMac(), sizeof(sai_mac_t)) == 0;
+    }
+
+    static bool prefixAddrEquals(const sai_ip_prefix_t &p, const string &ip)
+    {
+        swss::IpAddress expected(ip);
+        return p.addr_family == SAI_IP_ADDR_FAMILY_IPV4 &&
+               p.addr.ip4 == expected.getV4Addr();
+    }
+
     // Captured VXLAN tunnel SAI objects with the attributes VNetOrch /
     // VxlanTunnelOrch program -- the mock-test equivalent of the ASIC_DB reads
     // in vnet_lib.check_vxlan_tunnel() / check_vxlan_tunnel_entry().
@@ -125,6 +151,47 @@ namespace vnetorch_test
         vector<sai_object_id_t> removedMapEntries;
     };
 
+    // Captured SAI next-hop / next-hop-group / route objects VNetRouteOrch
+    // programs for a VNET tunnel route -- the mock-test equivalent of the
+    // ASIC_DB reads in vnet_lib.check_vnet_routes() / check_vnet_ecmp_routes().
+    struct RouteCaptures
+    {
+        struct NextHop
+        {
+            sai_object_id_t oid = SAI_NULL_OBJECT_ID;
+            int32_t type = -1;
+            sai_ip_address_t ip{};
+            sai_object_id_t tunnel_id = SAI_NULL_OBJECT_ID;
+            bool has_vni = false;
+            uint32_t vni = 0;
+            bool has_mac = false;
+            sai_mac_t mac{};
+        };
+        struct Group { sai_object_id_t oid = SAI_NULL_OBJECT_ID; int32_t type = -1; };
+        struct Member
+        {
+            sai_object_id_t oid = SAI_NULL_OBJECT_ID;
+            sai_object_id_t nhg = SAI_NULL_OBJECT_ID;
+            sai_object_id_t nh = SAI_NULL_OBJECT_ID;
+            bool has_seq = false;
+            uint32_t seq = 0;
+        };
+        struct Route
+        {
+            sai_object_id_t vr = SAI_NULL_OBJECT_ID;
+            sai_ip_prefix_t dest{};
+            sai_object_id_t next_hop_id = SAI_NULL_OBJECT_ID;
+        };
+        vector<NextHop> nexthops;
+        vector<Group> groups;
+        vector<Member> members;
+        vector<Route> routes;
+        vector<sai_object_id_t> removedNexthops;
+        vector<sai_object_id_t> removedGroups;
+        vector<sai_object_id_t> removedMembers;
+        vector<sai_ip_prefix_t> removedRoutes;
+    };
+
     class VNetOrchTest : public MockOrchTest
     {
     protected:
@@ -147,6 +214,20 @@ namespace vnetorch_test
         decltype(sai_tunnel_api->remove_tunnel_term_table_entry) m_savedRemoveTunnelTerm{};
         TunnelCaptures m_tun;
 
+        unique_ptr<VNetRouteOrch> m_vnetRouteOrch;
+        RouteCaptures m_rt;
+
+        void SetUp() override
+        {
+            // gDB (the mock DB backing swss::Table) is process-global and is not
+            // flushed by MockOrchTest::TearDown(), so CONFIG/APP rows a test
+            // writes (VNET, VXLAN_TUNNEL, VNET_ROUTE_TUNNEL...) would linger and
+            // be re-consumed by the next test's addExistingData()+doTask(),
+            // inflating the captured SAI object counts. Reset before each test.
+            testing_db::reset();
+            MockOrchTest::SetUp();
+        }
+
         void ApplyInitialConfigs() override
         {
             // VNetOrch/VxlanTunnelOrch depend on ports being ready, so bring the
@@ -166,18 +247,62 @@ namespace vnetorch_test
         void PostSetUp() override
         {
             INIT_SAI_API_MOCK(virtual_router);
+            INIT_SAI_API_MOCK(next_hop);
+            INIT_SAI_API_MOCK(next_hop_group);
+            INIT_SAI_API_MOCK(route);
             MockSaiApis();
             m_vrMock = make_unique<VirtualRouterSaiMock>();
+            // Record every virtual-router create (the VNET's, plus any the route
+            // path drives) so created_oid always reflects the latest VR. Route
+            // tests capture the VNET's VR right after setVnet(), before any other.
+            ON_CALL(*mock_sai_virtual_router_api, create_virtual_router)
+                .WillByDefault(Invoke(m_vrMock.get(), &VirtualRouterSaiMock::handleCreate));
 
             installTunnelMock();
+            installRouteMock();
+
+            // VNetRouteOrch's ctor calls gBfdOrch->attach(this) with no null
+            // guard, so gBfdOrch must exist first. VNetRouteOrch has no dtor of
+            // its own (never detaches), so gBfdOrch must outlive it -- see
+            // PreTearDown for the matching teardown order.
+            TableConnector stateDbBfdSessionTable(m_state_db.get(), STATE_BFD_SESSION_TABLE_NAME);
+            gBfdOrch = new BfdOrch(m_app_db.get(), APP_BFD_SESSION_TABLE_NAME, stateDbBfdSessionTable);
+
+            // VNetRouteOrch::postRouteState() dereferences gTunneldecapOrch
+            // (getSubnetDecapConfig()) on every tunnel route, so it must exist
+            // before any route task runs. Subnet decap is disabled by default,
+            // so no decap term is programmed -- it just needs to be non-null.
+            vector<string> tunnel_tables = {
+                APP_TUNNEL_DECAP_TABLE_NAME, APP_TUNNEL_DECAP_TERM_TABLE_NAME};
+            gTunneldecapOrch = new TunnelDecapOrch(
+                m_app_db.get(), m_state_db.get(), m_config_db.get(), tunnel_tables);
+
+            // Drive VNetRouteOrch directly off the APP_DB VNET_ROUTE(_TUNNEL)
+            // tables, standing in for VNetCfgRouteOrch's CONFIG->APP translation
+            // (the same tables orchdaemon wires it to).
+            vector<string> vnet_route_tables = {
+                APP_VNET_RT_TABLE_NAME, APP_VNET_RT_TUNNEL_TABLE_NAME};
+            m_vnetRouteOrch = make_unique<VNetRouteOrch>(
+                m_app_db.get(), vnet_route_tables, m_vnetOrch);
         }
 
         void PreTearDown() override
         {
+            // Tear the route orch down before gBfdOrch: it attached to gBfdOrch
+            // in its ctor and relies on gBfdOrch staying alive until it is gone.
+            m_vnetRouteOrch.reset();
+            delete gBfdOrch;
+            gBfdOrch = nullptr;
+            delete gTunneldecapOrch;
+            gTunneldecapOrch = nullptr;
+
             restoreTunnelMock();
             m_vrMock.reset();
             RestoreSaiApis();
             DEINIT_SAI_API_MOCK(virtual_router);
+            DEINIT_SAI_API_MOCK(next_hop);
+            DEINIT_SAI_API_MOCK(next_hop_group);
+            DEINIT_SAI_API_MOCK(route);
         }
 
         void installTunnelMock()
@@ -296,6 +421,99 @@ namespace vnetorch_test
             mock_sai_tunnel = nullptr;
         }
 
+        // Capture the SAI next-hop / next-hop-group / route objects
+        // VNetRouteOrch programs, calling through to real libsaivs so downstream
+        // references (route -> next hop -> tunnel) resolve to valid OIDs.
+        // VNetRouteOrch uses the non-bulk single-object create calls.
+        void installRouteMock()
+        {
+            ON_CALL(*mock_sai_next_hop_api, create_next_hop(_, _, _, _))
+                .WillByDefault(Invoke([this](sai_object_id_t *id, sai_object_id_t sw,
+                                             uint32_t n, const sai_attribute_t *l) {
+                    sai_status_t st = old_sai_next_hop_api->create_next_hop(id, sw, n, l);
+                    if (st == SAI_STATUS_SUCCESS)
+                    {
+                        RouteCaptures::NextHop nh;
+                        nh.oid = *id;
+                        if (auto a = findRawAttr(l, n, SAI_NEXT_HOP_ATTR_TYPE)) nh.type = a->value.s32;
+                        if (auto a = findRawAttr(l, n, SAI_NEXT_HOP_ATTR_IP)) nh.ip = a->value.ipaddr;
+                        if (auto a = findRawAttr(l, n, SAI_NEXT_HOP_ATTR_TUNNEL_ID)) nh.tunnel_id = a->value.oid;
+                        if (auto a = findRawAttr(l, n, SAI_NEXT_HOP_ATTR_TUNNEL_VNI)) { nh.has_vni = true; nh.vni = a->value.u32; }
+                        if (auto a = findRawAttr(l, n, SAI_NEXT_HOP_ATTR_TUNNEL_MAC))
+                        {
+                            nh.has_mac = true;
+                            memcpy(nh.mac, a->value.mac, sizeof(sai_mac_t));
+                        }
+                        m_rt.nexthops.push_back(nh);
+                    }
+                    return st;
+                }));
+            ON_CALL(*mock_sai_next_hop_api, remove_next_hop(_))
+                .WillByDefault(Invoke([this](sai_object_id_t id) {
+                    m_rt.removedNexthops.push_back(id);
+                    return old_sai_next_hop_api->remove_next_hop(id);
+                }));
+
+            ON_CALL(*mock_sai_next_hop_group_api, create_next_hop_group(_, _, _, _))
+                .WillByDefault(Invoke([this](sai_object_id_t *id, sai_object_id_t sw,
+                                             uint32_t n, const sai_attribute_t *l) {
+                    sai_status_t st = old_sai_next_hop_group_api->create_next_hop_group(id, sw, n, l);
+                    if (st == SAI_STATUS_SUCCESS)
+                    {
+                        RouteCaptures::Group g;
+                        g.oid = *id;
+                        if (auto a = findRawAttr(l, n, SAI_NEXT_HOP_GROUP_ATTR_TYPE)) g.type = a->value.s32;
+                        m_rt.groups.push_back(g);
+                    }
+                    return st;
+                }));
+            ON_CALL(*mock_sai_next_hop_group_api, remove_next_hop_group(_))
+                .WillByDefault(Invoke([this](sai_object_id_t id) {
+                    m_rt.removedGroups.push_back(id);
+                    return old_sai_next_hop_group_api->remove_next_hop_group(id);
+                }));
+            ON_CALL(*mock_sai_next_hop_group_api, create_next_hop_group_member(_, _, _, _))
+                .WillByDefault(Invoke([this](sai_object_id_t *id, sai_object_id_t sw,
+                                             uint32_t n, const sai_attribute_t *l) {
+                    sai_status_t st = old_sai_next_hop_group_api->create_next_hop_group_member(id, sw, n, l);
+                    if (st == SAI_STATUS_SUCCESS)
+                    {
+                        RouteCaptures::Member m;
+                        m.oid = *id;
+                        if (auto a = findRawAttr(l, n, SAI_NEXT_HOP_GROUP_MEMBER_ATTR_NEXT_HOP_GROUP_ID)) m.nhg = a->value.oid;
+                        if (auto a = findRawAttr(l, n, SAI_NEXT_HOP_GROUP_MEMBER_ATTR_NEXT_HOP_ID)) m.nh = a->value.oid;
+                        if (auto a = findRawAttr(l, n, SAI_NEXT_HOP_GROUP_MEMBER_ATTR_SEQUENCE_ID)) { m.has_seq = true; m.seq = a->value.u32; }
+                        m_rt.members.push_back(m);
+                    }
+                    return st;
+                }));
+            ON_CALL(*mock_sai_next_hop_group_api, remove_next_hop_group_member(_))
+                .WillByDefault(Invoke([this](sai_object_id_t id) {
+                    m_rt.removedMembers.push_back(id);
+                    return old_sai_next_hop_group_api->remove_next_hop_group_member(id);
+                }));
+
+            ON_CALL(*mock_sai_route_api, create_route_entry(_, _, _))
+                .WillByDefault(Invoke([this](const sai_route_entry_t *e, uint32_t n,
+                                             const sai_attribute_t *l) {
+                    sai_status_t st = old_sai_route_api->create_route_entry(e, n, l);
+                    if (st == SAI_STATUS_SUCCESS)
+                    {
+                        RouteCaptures::Route r;
+                        r.vr = e->vr_id;
+                        r.dest = e->destination;
+                        if (auto a = findRawAttr(l, n, SAI_ROUTE_ENTRY_ATTR_NEXT_HOP_ID)) r.next_hop_id = a->value.oid;
+                        m_rt.routes.push_back(r);
+                    }
+                    return st;
+                }));
+            ON_CALL(*mock_sai_route_api, remove_route_entry(_))
+                .WillByDefault(Invoke([this](const sai_route_entry_t *e) {
+                    m_rt.removedRoutes.push_back(e->destination);
+                    return old_sai_route_api->remove_route_entry(e);
+                }));
+        }
+
         // The VS test writes VXLAN_TUNNEL / VNET to CONFIG_DB and relies on
         // vxlanmgr/vrfmgr to mirror them into APP_DB (vrfmgr passes the VNET
         // fields through unchanged). The mock harness has no cfgmgr daemons, so
@@ -332,6 +550,48 @@ namespace vnetorch_test
             auto consumer = dynamic_cast<Consumer *>(m_VxlanTunnelOrch->getExecutor(APP_VXLAN_TUNNEL_TABLE_NAME));
             consumer->addToSync({{name, DEL_COMMAND, {}}});
             static_cast<Orch *>(m_VxlanTunnelOrch)->doTask(*consumer);
+        }
+
+        // The VS test writes CONFIG_DB VNET_ROUTE_TUNNEL and relies on
+        // VNetCfgRouteOrch to mirror it to APP_DB VNET_ROUTE_TUNNEL_TABLE. The
+        // mock harness has no VNetCfgRouteOrch, so we write the APP_DB entry it
+        // would have produced (key "vnet:prefix", the ':' separator
+        // VNetRouteRequest uses). endpoint is a comma-separated list -> a single
+        // endpoint programs one tunnel next hop; multiple endpoints program an
+        // ECMP next hop group.
+        void setVnetRoute(const string &vnet, const string &prefix,
+                          const string &endpoints, const string &mac = "",
+                          const string &vni = "")
+        {
+            vector<FieldValueTuple> fvs = {{"endpoint", endpoints}};
+            if (!mac.empty()) fvs.push_back({"mac_address", mac});
+            if (!vni.empty()) fvs.push_back({"vni", vni});
+            Table tbl(m_app_db.get(), APP_VNET_RT_TUNNEL_TABLE_NAME);
+            tbl.set(vnet + ":" + prefix, fvs);
+            m_vnetRouteOrch->addExistingData(&tbl);
+            static_cast<Orch *>(m_vnetRouteOrch.get())->doTask();
+        }
+
+        void delVnetRoute(const string &vnet, const string &prefix)
+        {
+            auto consumer = dynamic_cast<Consumer *>(
+                m_vnetRouteOrch->getExecutor(APP_VNET_RT_TUNNEL_TABLE_NAME));
+            consumer->addToSync({{vnet + ":" + prefix, DEL_COMMAND, {}}});
+            static_cast<Orch *>(m_vnetRouteOrch.get())->doTask(*consumer);
+        }
+
+        // Find the captured route for an IPv4 prefix, skipping the VNET's IPv6
+        // link-local route that RouteOrch programs during bind.
+        const RouteCaptures::Route *findRoute(const string &ip) const
+        {
+            for (const auto &r : m_rt.routes)
+            {
+                if (prefixAddrEquals(r.dest, ip))
+                {
+                    return &r;
+                }
+            }
+            return nullptr;
         }
     };
 
@@ -453,5 +713,130 @@ namespace vnetorch_test
         EXPECT_EQ(m_tun.removedTunnels.size(), 1U);
         EXPECT_EQ(m_tun.removedMaps.size(), 4U);
         EXPECT_EQ(m_tun.removedTerms.size(), 1U);
+    }
+
+    // A single-endpoint VNET tunnel route programs one SAI tunnel encap next hop
+    // (TUNNEL_ENCAP over the VNET's tunnel to the endpoint) and one route entry
+    // in the VNET's virtual router pointing straight at it -- the mock
+    // equivalent of vnet_lib.check_vnet_routes() with a single endpoint.
+    TEST_F(VNetOrchTest, VnetRouteProgramsTunnelNextHop)
+    {
+        setVxlanTunnel("tunnel_v4", "10.10.10.10");
+        setVnet("Vnet_2000", "tunnel_v4", "2000", "");
+        const sai_object_id_t vnetVr = m_vrMock->created_oid;
+
+        setVnetRoute("Vnet_2000", "100.100.1.1/32", "10.10.10.1");
+
+        // One tunnel encap next hop to the endpoint, over the VNET's tunnel.
+        ASSERT_EQ(m_rt.nexthops.size(), 1U);
+        const auto &nh = m_rt.nexthops[0];
+        EXPECT_EQ(nh.type, SAI_NEXT_HOP_TYPE_TUNNEL_ENCAP);
+        EXPECT_TRUE(ipAddrEquals(nh.ip, "10.10.10.1"));
+        ASSERT_EQ(m_tun.tunnels.size(), 1U);
+        EXPECT_EQ(nh.tunnel_id, m_tun.tunnels[0].oid);
+        EXPECT_FALSE(nh.has_vni);
+        EXPECT_FALSE(nh.has_mac);
+
+        // Single endpoint -> no next hop group; the route points at the next hop.
+        EXPECT_TRUE(m_rt.groups.empty());
+
+        const RouteCaptures::Route *r = findRoute("100.100.1.1");
+        ASSERT_NE(r, nullptr);
+        EXPECT_EQ(r->vr, vnetVr);
+        EXPECT_EQ(r->next_hop_id, nh.oid);
+    }
+
+    // A route whose endpoint carries an inner MAC programs the tunnel next hop
+    // with SAI_NEXT_HOP_ATTR_TUNNEL_MAC -- vnet_lib.check_vnet_routes(..., mac).
+    TEST_F(VNetOrchTest, VnetRouteWithMacProgramsTunnelMac)
+    {
+        setVxlanTunnel("tunnel_v4", "10.10.10.10");
+        setVnet("Vnet_2000", "tunnel_v4", "2000", "");
+
+        setVnetRoute("Vnet_2000", "100.100.2.1/32", "10.10.10.2", "00:12:34:56:78:9A");
+
+        ASSERT_EQ(m_rt.nexthops.size(), 1U);
+        const auto &nh = m_rt.nexthops[0];
+        EXPECT_EQ(nh.type, SAI_NEXT_HOP_TYPE_TUNNEL_ENCAP);
+        EXPECT_TRUE(ipAddrEquals(nh.ip, "10.10.10.2"));
+        ASSERT_TRUE(nh.has_mac);
+        EXPECT_TRUE(saiMacEquals(nh.mac, "00:12:34:56:78:9A"));
+    }
+
+    // A multi-endpoint route programs one tunnel encap next hop per endpoint, a
+    // next hop group binding them, and a route entry pointing at the group --
+    // the mock equivalent of vnet_lib.check_vnet_ecmp_routes().
+    TEST_F(VNetOrchTest, VnetEcmpRouteProgramsNextHopGroup)
+    {
+        setVxlanTunnel("tunnel_v4", "7.7.7.7");
+        setVnet("Vnet1", "tunnel_v4", "10007", "");
+        const sai_object_id_t vnetVr = m_vrMock->created_oid;
+
+        setVnetRoute("Vnet1", "100.100.1.1/32", "7.0.0.1,7.0.0.2,7.0.0.3");
+
+        // One tunnel encap next hop per endpoint, all over the VNET's tunnel.
+        ASSERT_EQ(m_rt.nexthops.size(), 3U);
+        ASSERT_EQ(m_tun.tunnels.size(), 1U);
+        for (const auto &nh : m_rt.nexthops)
+        {
+            EXPECT_EQ(nh.type, SAI_NEXT_HOP_TYPE_TUNNEL_ENCAP);
+            EXPECT_EQ(nh.tunnel_id, m_tun.tunnels[0].oid);
+        }
+        for (const char *ep : {"7.0.0.1", "7.0.0.2", "7.0.0.3"})
+        {
+            bool found = false;
+            for (const auto &nh : m_rt.nexthops)
+            {
+                if (ipAddrEquals(nh.ip, ep)) found = true;
+            }
+            EXPECT_TRUE(found) << "missing tunnel next hop for endpoint " << ep;
+        }
+
+        // One next hop group. Orchagent programs SAI_NEXT_HOP_GROUP_TYPE_ECMP,
+        // which is the same enum value libsairedis serializes to the
+        // ..._DYNAMIC_UNORDERED_ECMP string the VS test matches.
+        ASSERT_EQ(m_rt.groups.size(), 1U);
+        const sai_object_id_t nhg = m_rt.groups[0].oid;
+        EXPECT_EQ(m_rt.groups[0].type, SAI_NEXT_HOP_GROUP_TYPE_ECMP);
+
+        // One member per endpoint, all bound to the group, each referencing a
+        // captured tunnel next hop.
+        ASSERT_EQ(m_rt.members.size(), 3U);
+        set<sai_object_id_t> nhOids;
+        for (const auto &nh : m_rt.nexthops) nhOids.insert(nh.oid);
+        for (const auto &m : m_rt.members)
+        {
+            EXPECT_EQ(m.nhg, nhg);
+            EXPECT_EQ(nhOids.count(m.nh), 1U);
+        }
+
+        // The route points at the group, in the VNET's virtual router.
+        const RouteCaptures::Route *r = findRoute("100.100.1.1");
+        ASSERT_NE(r, nullptr);
+        EXPECT_EQ(r->vr, vnetVr);
+        EXPECT_EQ(r->next_hop_id, nhg);
+    }
+
+    // Deleting a single-endpoint route removes its route entry and the tunnel
+    // next hop (vnet_lib.check_del_vnet_routes()). The delete flows through the
+    // consumer as a DEL_COMMAND so the delete handler actually runs.
+    TEST_F(VNetOrchTest, VnetRouteDeleteRemovesObjects)
+    {
+        setVxlanTunnel("tunnel_v4", "10.10.10.10");
+        setVnet("Vnet_2000", "tunnel_v4", "2000", "");
+        setVnetRoute("Vnet_2000", "100.100.1.1/32", "10.10.10.1");
+        ASSERT_EQ(m_rt.nexthops.size(), 1U);
+        const sai_object_id_t nhOid = m_rt.nexthops[0].oid;
+
+        delVnetRoute("Vnet_2000", "100.100.1.1/32");
+
+        bool routeRemoved = false;
+        for (const auto &d : m_rt.removedRoutes)
+        {
+            if (prefixAddrEquals(d, "100.100.1.1")) routeRemoved = true;
+        }
+        EXPECT_TRUE(routeRemoved);
+        EXPECT_NE(find(m_rt.removedNexthops.begin(), m_rt.removedNexthops.end(), nhOid),
+                  m_rt.removedNexthops.end());
     }
 }
