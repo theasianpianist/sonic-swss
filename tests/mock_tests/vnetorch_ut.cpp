@@ -199,6 +199,7 @@ namespace vnetorch_test
             int32_t type = -1;
             sai_ip_address_t ip{};
             sai_object_id_t tunnel_id = SAI_NULL_OBJECT_ID;
+            sai_object_id_t rif = SAI_NULL_OBJECT_ID;
             bool has_vni = false;
             uint32_t vni = 0;
             bool has_mac = false;
@@ -636,6 +637,13 @@ namespace vnetorch_test
             m_vxlanTunnelMapOrch = make_unique<VxlanTunnelMapOrch>(
                 m_app_db.get(), APP_VXLAN_TUNNEL_MAP_TABLE_NAME);
             gDirectory.set(m_vxlanTunnelMapOrch.get());
+
+            // FdbOrch observes port oper-status changes and, on a DOWN, calls
+            // gMlagOrch->isMlagInterface(); orchdaemon always builds an MlagOrch,
+            // so the fixture does too -- otherwise a port-down test segfaults on
+            // the null gMlagOrch (fdborch.cpp:1722).
+            vector<string> mlag_tables = {CFG_MCLAG_TABLE_NAME, CFG_MCLAG_INTF_TABLE_NAME};
+            gMlagOrch = new MlagOrch(m_config_db.get(), mlag_tables);
         }
 
         void PreTearDown() override
@@ -643,6 +651,8 @@ namespace vnetorch_test
             // Tear the route orch down before gBfdOrch: it attached to gBfdOrch
             // in its ctor and relies on gBfdOrch staying alive until it is gone.
             m_vxlanTunnelMapOrch.reset();
+            delete gMlagOrch;
+            gMlagOrch = nullptr;
             m_bfdMonitorOrch.reset();
             m_monitorOrch.reset();
             m_vnetRouteOrch.reset();
@@ -836,6 +846,7 @@ namespace vnetorch_test
                         if (auto a = findRawAttr(l, n, SAI_NEXT_HOP_ATTR_TYPE)) nh.type = a->value.s32;
                         if (auto a = findRawAttr(l, n, SAI_NEXT_HOP_ATTR_IP)) nh.ip = a->value.ipaddr;
                         if (auto a = findRawAttr(l, n, SAI_NEXT_HOP_ATTR_TUNNEL_ID)) nh.tunnel_id = a->value.oid;
+                        if (auto a = findRawAttr(l, n, SAI_NEXT_HOP_ATTR_ROUTER_INTERFACE_ID)) nh.rif = a->value.oid;
                         if (auto a = findRawAttr(l, n, SAI_NEXT_HOP_ATTR_TUNNEL_VNI)) { nh.has_vni = true; nh.vni = a->value.u32; }
                         if (auto a = findRawAttr(l, n, SAI_NEXT_HOP_ATTR_TUNNEL_MAC))
                         {
@@ -2065,6 +2076,50 @@ namespace vnetorch_test
         {
             EXPECT_EQ(findRoute(prefix.substr(0, prefix.find('/'))), nullptr)
                 << "local route " << prefix << " not removed";
+        }
+
+        // The SAI router-interface OID IntfsOrch created for a port (a real
+        // libsaivs RIF -- only the VR/NH/NHG/route/bfd/tunnel APIs are mocked).
+        sai_object_id_t rifOf(const string &port)
+        {
+            Port p;
+            if (!gPortsOrch->getPort(port, p)) return SAI_NULL_OBJECT_ID;
+            return p.m_rif_id;
+        }
+
+        // Collect the router interfaces the prefix's active next hop(s) resolve
+        // to -- a lone IP next hop's RIF, or every *active* NHG member's next-hop
+        // RIF -- and assert they equal the expected set. In the unnumbered-ECMP
+        // case the members share one next-hop IP, so the RIF (not the IP) is what
+        // distinguishes them, mirroring test37's _nhgm_rifs()/_nh_rif() checks.
+        void checkVnetLocalRouteRifs(const string &prefix,
+                                     const set<sai_object_id_t> &expected)
+        {
+            const RouteCaptures::Route *r = findRoute(prefix.substr(0, prefix.find('/')));
+            ASSERT_NE(r, nullptr) << "no local route for prefix " << prefix;
+            auto rifOfNh = [&](sai_object_id_t nhoid) -> sai_object_id_t {
+                for (auto it = m_rt.nexthops.rbegin(); it != m_rt.nexthops.rend(); ++it)
+                    if (it->oid == nhoid) return it->rif;
+                return SAI_NULL_OBJECT_ID;
+            };
+            bool isGroup = false;
+            for (const auto &g : m_rt.groups)
+                if (g.oid == r->next_hop_id) { isGroup = true; break; }
+            set<sai_object_id_t> got;
+            if (!isGroup)
+            {
+                got.insert(rifOfNh(r->next_hop_id));
+            }
+            else
+            {
+                for (const auto &m : m_rt.members)
+                    if (m.nhg == r->next_hop_id &&
+                        find(m_rt.removedMembers.begin(), m_rt.removedMembers.end(),
+                             m.oid) == m_rt.removedMembers.end())
+                        got.insert(rifOfNh(m.nh));
+            }
+            EXPECT_EQ(got, expected)
+                << "prefix " << prefix << " next-hop RIF set mismatch";
         }
     };
 
@@ -3807,6 +3862,62 @@ namespace vnetorch_test
         // Delete removes the route.
         delVnetLocalRoute("Vnet5001", "10.10.0.0/24");
         checkVnetLocalRouteRemoved("10.10.0.0/24");
+    }
+
+    // Migrates test_vnet_local_route_ecmp_unnumbered: a VNET local ECMP route
+    // whose members share ONE (link-local) next-hop IP reachable via two
+    // interfaces -- the "unnumbered" case learned from FRR/BGP. master's
+    // VNetRouteOrch parses `nexthop` as an ordered ip/ifname *list* (duplicate
+    // IPs preserved) rather than a deduped IpAddresses set, so 169.254.0.1 listed
+    // twice with different ifnames yields a 2-member NHG on distinct RIFs instead
+    // of collapsing to one. Because the IP is identical, membership is asserted by
+    // RIF, exactly as the VS test does via _nhgm_rifs()/_nh_rif().
+    TEST_F(VNetOrchTest, VnetLocalRouteUnnumberedEcmp)
+    {
+        setVxlanTunnel("tunnel_5099", "99.99.99.99");
+        setVnet("Vnet5099", "tunnel_5099", "5099", "");
+
+        // Two VNET-bound RIFs; the same next-hop IP is reachable via both.
+        createVnetL3Interface("Ethernet20", "Vnet5099", "10.77.0.4/30");
+        createVnetL3Interface("Ethernet16", "Vnet5099", "10.77.0.8/30");
+        const sai_object_id_t rif_a = rifOf("Ethernet20");
+        const sai_object_id_t rif_b = rifOf("Ethernet16");
+        ASSERT_NE(rif_a, SAI_NULL_OBJECT_ID);
+        ASSERT_NE(rif_b, SAI_NULL_OBJECT_ID);
+        ASSERT_NE(rif_a, rif_b);
+        addNeighbor("Ethernet20", "169.254.0.1", "00:01:02:03:04:05");
+        addNeighbor("Ethernet16", "169.254.0.1", "00:01:02:03:04:06");
+
+        // Phase A: duplicate IP + 2 ifnames -> 2-member NHG on distinct RIFs.
+        setVnetLocalRoute("Vnet5099", "10.99.0.0/24", "Ethernet20,Ethernet16",
+                          "169.254.0.1,169.254.0.1");
+        checkVnetLocalRouteRifs("10.99.0.0/24", {rif_a, rif_b});
+
+        // Phase B: shrink to 1 ifname -> a single IP next hop on rif_a (no group).
+        setVnetLocalRoute("Vnet5099", "10.99.0.0/24", "Ethernet20", "169.254.0.1");
+        checkVnetLocalRouteRifs("10.99.0.0/24", {rif_a});
+
+        // Phase C: grow back to 2 -> a new 2-member NHG on both RIFs.
+        setVnetLocalRoute("Vnet5099", "10.99.0.0/24", "Ethernet20,Ethernet16",
+                          "169.254.0.1,169.254.0.1");
+        checkVnetLocalRouteRifs("10.99.0.0/24", {rif_a, rif_b});
+
+        // Phase D: Ethernet16 goes oper-down -> its next hop is IFDOWN-flagged and
+        // pruned (NeighOrch::ifChangeInformNextHop ->
+        // RouteOrch::invalidnexthopinNextHopGroup); the group survives on rif_a.
+        setPortOperStatus("Ethernet16", SAI_PORT_OPER_STATUS_DOWN);
+        checkVnetLocalRouteRifs("10.99.0.0/24", {rif_a});
+
+        // Phase E: Ethernet16 back up + neighbor re-learned -> the member reforms.
+        setPortOperStatus("Ethernet16", SAI_PORT_OPER_STATUS_UP);
+        addNeighbor("Ethernet16", "169.254.0.1", "00:01:02:03:04:06");
+        checkVnetLocalRouteRifs("10.99.0.0/24", {rif_a, rif_b});
+
+        // Cleanup.
+        delVnetLocalRoute("Vnet5099", "10.99.0.0/24");
+        checkVnetLocalRouteRemoved("10.99.0.0/24");
+        delVnet("Vnet5099");
+        delVxlanTunnel("tunnel_5099");
     }
 
     // Mock equivalent of test_vnet_orch_local_endpoint_alias_resolution: a
