@@ -449,6 +449,12 @@ namespace vnetorch_test
         TunnelCaptures m_tun;
 
         unique_ptr<VNetRouteOrch> m_vnetRouteOrch;
+        // Mirrors CONFIG_DB VNET_ROUTE / VNET_ROUTE_TUNNEL into the APP_DB tables
+        // VNetRouteOrch consumes, exactly as orchdaemon's VNetCfgRouteOrch does
+        // (orchdaemon.cpp:307). The route SET helpers drive routes through this
+        // real CONFIG->APP path, matching the VS test's create_vnet_routes /
+        // create_vnet_local_routes (which write CONFIG_DB VNET_ROUTE[_TUNNEL]).
+        unique_ptr<VNetCfgRouteOrch> m_vnetCfgRouteOrch;
         RouteCaptures m_rt;
 
         // Consumes STATE_DB VNET_MONITOR_TABLE (the table update_monitor_session_
@@ -601,6 +607,18 @@ namespace vnetorch_test
             // same way orchdaemon does. gDirectory is cleared by the base
             // teardown after PreTearDown, so no stale pointer survives the test.
             gDirectory.set(m_vnetRouteOrch.get());
+
+            // The real CONFIG->APP translation for VNET routes
+            // (orchdaemon.cpp:307). The route SET helpers write CONFIG_DB
+            // VNET_ROUTE[_TUNNEL] and drive this orch, which mirrors each row to
+            // the APP_DB VNET_ROUTE[_TUNNEL]_TABLE that VNetRouteOrch consumes --
+            // so the mock exercises doVnetRouteTask/doVnetTunnelRouteTask exactly
+            // as the VS test's create_vnet_routes/create_vnet_local_routes did.
+            vector<string> cfg_vnet_route_tables = {
+                CFG_VNET_RT_TABLE_NAME, CFG_VNET_RT_TUNNEL_TABLE_NAME};
+            m_vnetCfgRouteOrch = make_unique<VNetCfgRouteOrch>(
+                m_config_db.get(), m_app_db.get(), cfg_vnet_route_tables);
+
             m_monitorOrch = make_unique<MonitorOrch>(
                 m_state_db.get(), STATE_VNET_MONITOR_TABLE_NAME);
 
@@ -628,6 +646,7 @@ namespace vnetorch_test
             m_bfdMonitorOrch.reset();
             m_monitorOrch.reset();
             m_vnetRouteOrch.reset();
+            m_vnetCfgRouteOrch.reset();
             delete gBfdOrch;
             gBfdOrch = nullptr;
             delete gTunneldecapOrch;
@@ -1016,13 +1035,30 @@ namespace vnetorch_test
             static_cast<Orch *>(m_VxlanTunnelOrch)->doTask(*consumer);
         }
 
+        // Program a VNET route the way the VS tests did: write CONFIG_DB
+        // VNET_ROUTE_TUNNEL / VNET_ROUTE (key "vnet|prefix") and drive
+        // VNetCfgRouteOrch, which mirrors it (doVnetTunnelRouteTask /
+        // doVnetRouteTask) to the APP_DB table VNetRouteOrch consumes; then drive
+        // VNetRouteOrch off that APP_DB row. This exercises the real CONFIG->APP
+        // translation instead of writing APP_DB directly.
+        void programVnetRouteViaCfg(const string &cfgTable, const string &appTable,
+                                    const string &vnet, const string &prefix,
+                                    const vector<FieldValueTuple> &fvs)
+        {
+            Table cfg(m_config_db.get(), cfgTable);
+            cfg.set(vnet + "|" + prefix, fvs);
+            m_vnetCfgRouteOrch->addExistingData(&cfg);
+            static_cast<Orch *>(m_vnetCfgRouteOrch.get())->doTask();
+            Table app(m_app_db.get(), appTable);
+            m_vnetRouteOrch->addExistingData(&app);
+            static_cast<Orch *>(m_vnetRouteOrch.get())->doTask();
+        }
+
         // The VS test writes CONFIG_DB VNET_ROUTE_TUNNEL and relies on
-        // VNetCfgRouteOrch to mirror it to APP_DB VNET_ROUTE_TUNNEL_TABLE. The
-        // mock harness has no VNetCfgRouteOrch, so we write the APP_DB entry it
-        // would have produced (key "vnet:prefix", the ':' separator
-        // VNetRouteRequest uses). endpoint is a comma-separated list -> a single
-        // endpoint programs one tunnel next hop; multiple endpoints program an
-        // ECMP next hop group.
+        // VNetCfgRouteOrch to mirror it to APP_DB VNET_ROUTE_TUNNEL_TABLE; the
+        // mock drives that same path via programVnetRouteViaCfg. endpoint is a
+        // comma-separated list -> a single endpoint programs one tunnel next
+        // hop; multiple endpoints program an ECMP next hop group.
         void setVnetRoute(const string &vnet, const string &prefix,
                           const string &endpoints, const string &mac = "",
                           const string &vni = "", const string &metric = "")
@@ -1031,10 +1067,8 @@ namespace vnetorch_test
             if (!mac.empty()) fvs.push_back({"mac_address", mac});
             if (!vni.empty()) fvs.push_back({"vni", vni});
             if (!metric.empty()) fvs.push_back({"metric", metric});
-            Table tbl(m_app_db.get(), APP_VNET_RT_TUNNEL_TABLE_NAME);
-            tbl.set(vnet + ":" + prefix, fvs);
-            m_vnetRouteOrch->addExistingData(&tbl);
-            static_cast<Orch *>(m_vnetRouteOrch.get())->doTask();
+            programVnetRouteViaCfg(CFG_VNET_RT_TUNNEL_TABLE_NAME,
+                                   APP_VNET_RT_TUNNEL_TABLE_NAME, vnet, prefix, fvs);
         }
 
         void delVnetRoute(const string &vnet, const string &prefix)
@@ -1065,10 +1099,8 @@ namespace vnetorch_test
             vector<FieldValueTuple> fvs = {{"endpoint", endpoints},
                                            {"endpoint_monitor", monitors}};
             if (!profile.empty()) fvs.push_back({"profile", profile});
-            Table tbl(m_app_db.get(), APP_VNET_RT_TUNNEL_TABLE_NAME);
-            tbl.set(vnet + ":" + prefix, fvs);
-            m_vnetRouteOrch->addExistingData(&tbl);
-            static_cast<Orch *>(m_vnetRouteOrch.get())->doTask();
+            programVnetRouteViaCfg(CFG_VNET_RT_TUNNEL_TABLE_NAME,
+                                   APP_VNET_RT_TUNNEL_TABLE_NAME, vnet, prefix, fvs);
             syncBfd();
             syncTunnelDecapTerm();
         }
@@ -1112,10 +1144,8 @@ namespace vnetorch_test
             if (rx_monitor_timer >= 0) fvs.push_back({"rx_monitor_timer", to_string(rx_monitor_timer)});
             if (tx_monitor_timer >= 0) fvs.push_back({"tx_monitor_timer", to_string(tx_monitor_timer)});
             if (!pinned_state.empty()) fvs.push_back({"pinned_state", pinned_state});
-            Table tbl(m_app_db.get(), APP_VNET_RT_TUNNEL_TABLE_NAME);
-            tbl.set(vnet + ":" + prefix, fvs);
-            m_vnetRouteOrch->addExistingData(&tbl);
-            static_cast<Orch *>(m_vnetRouteOrch.get())->doTask();
+            programVnetRouteViaCfg(CFG_VNET_RT_TUNNEL_TABLE_NAME,
+                                   APP_VNET_RT_TUNNEL_TABLE_NAME, vnet, prefix, fvs);
             if (monitoring == "custom_bfd") syncBfd();
         }
 
@@ -1971,20 +2001,18 @@ namespace vnetorch_test
         }
 
         // The VS test writes CONFIG_DB VNET_ROUTE (ifname + nexthop) and relies on
-        // VNetCfgRouteOrch to mirror it to APP_DB VNET_ROUTE_TABLE. The mock
-        // harness has no VNetCfgRouteOrch, so we write the APP_DB entry it would
-        // have produced (key "vnet:prefix"). A non-empty nexthop list makes this a
-        // VNET local route: VNetRouteOrch::handleRoutes() -> doRouteTask() builds
-        // an ip@ifname next-hop-group string and programs it through gRouteOrch,
-        // resolving each nexthop to the neighbor's SAI_NEXT_HOP_TYPE_IP next hop.
+        // VNetCfgRouteOrch to mirror it to APP_DB VNET_ROUTE_TABLE; the mock drives
+        // that same CONFIG->APP path via programVnetRouteViaCfg. A non-empty
+        // nexthop list makes this a VNET local route: VNetRouteOrch::handleRoutes()
+        // -> doRouteTask() builds an ip@ifname next-hop-group string and programs
+        // it through gRouteOrch, resolving each nexthop to the neighbor's
+        // SAI_NEXT_HOP_TYPE_IP next hop.
         void setVnetLocalRoute(const string &vnet, const string &prefix,
                                const string &ifnames, const string &nexthops)
         {
             vector<FieldValueTuple> fvs = {{"ifname", ifnames}, {"nexthop", nexthops}};
-            Table tbl(m_app_db.get(), APP_VNET_RT_TABLE_NAME);
-            tbl.set(vnet + ":" + prefix, fvs);
-            m_vnetRouteOrch->addExistingData(&tbl);
-            static_cast<Orch *>(m_vnetRouteOrch.get())->doTask();
+            programVnetRouteViaCfg(CFG_VNET_RT_TABLE_NAME,
+                                   APP_VNET_RT_TABLE_NAME, vnet, prefix, fvs);
         }
 
         void delVnetLocalRoute(const string &vnet, const string &prefix)
@@ -4425,6 +4453,49 @@ namespace vnetorch_test
         EXPECT_EQ(m_tun.removedTunnels.size(), 1U);
         EXPECT_EQ(m_tun.removedMaps.size(), 4U);
         EXPECT_EQ(m_tun.removedTerms.size(), 1U);
+    }
+
+    // Migration of test_vnet_orch_4's peering scenario. In the VS suite that test
+    // is @pytest.mark.skip ("Failing. Under investigation"), so this restores real
+    // coverage of the VNET peering path rather than duplicating a live test. Two
+    // VNETs list each other in peer_list; a tunnel route created in one VNET is
+    // replicated into the peer VNET's virtual router as well as its own --
+    // VNetRouteOrch::doRouteTask<VNetVrfObject> builds vr_set = getVRids(own) plus
+    // each peer's VRidIngress and programs the route once per VR
+    // (vnetorch.cpp:1746-1784). This is the check_vnet_routes(dvs, 'Vnet3004', ...)
+    // assertion the VS test made on the *peer* VNET.
+    TEST_F(VNetOrchTest, VnetPeeringReplicatesRouteIntoPeerVr)
+    {
+        setVxlanTunnel("tunnel_peer", "10.10.10.10");
+
+        // Vnet_peerA and Vnet_peerB peer with each other; each gets its own VR.
+        setVnet("Vnet_peerA", "tunnel_peer", "3003", "Vnet_peerB");
+        const sai_object_id_t vrA = m_vrMock->created_oid;
+        setVnet("Vnet_peerB", "tunnel_peer", "3004", "Vnet_peerA");
+        const sai_object_id_t vrB = m_vrMock->created_oid;
+        ASSERT_NE(vrA, SAI_NULL_OBJECT_ID);
+        ASSERT_NE(vrB, SAI_NULL_OBJECT_ID);
+        ASSERT_NE(vrA, vrB);
+
+        // A tunnel route created in Vnet_peerA must be programmed in BOTH VRs.
+        setVnetRoute("Vnet_peerA", "5.5.5.10/32", "fd:2::35");
+
+        set<sai_object_id_t> vrs;
+        for (const auto &r : m_rt.routes)
+            if (prefixAddrEquals(r.dest, "5.5.5.10")) vrs.insert(r.vr);
+        EXPECT_TRUE(vrs.count(vrA)) << "route missing from its own VNET's VR";
+        EXPECT_TRUE(vrs.count(vrB)) << "route not replicated into the peer VNET's VR";
+        EXPECT_EQ(vrs.size(), 2U);
+        // Both VRs point the prefix at the same remote tunnel-encap next hop.
+        checkEndpointType("fd:2::35", SAI_NEXT_HOP_TYPE_TUNNEL_ENCAP);
+
+        // Deleting the route withdraws it from both VRs (doRouteTask DEL iterates
+        // the same vr_set); tearing down mirrors the VS order.
+        delVnetRoute("Vnet_peerA", "5.5.5.10/32");
+        EXPECT_EQ(findRoute("5.5.5.10"), nullptr);
+        delVnet("Vnet_peerA");
+        delVnet("Vnet_peerB");
+        delVxlanTunnel("tunnel_peer");
     }
 
     // Mock equivalent of test_vnet_orch_24 -- the duplicate-route regression from
