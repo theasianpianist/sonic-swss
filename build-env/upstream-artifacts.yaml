@@ -58,7 +58,7 @@ upstream:
     cascade_optional: false
     result_filter: [succeeded, partiallySucceeded]
     apt_fix_broken: true
-    dpkg_args: [--force-confask,confnew]
+    dpkg_args: ["--force-confask,confnew"]
     artifact_name: sonic-swss-common.amd64.ubuntu22_04
     debs:
       - 'libswsscommon_1.0.0_amd64.deb'
