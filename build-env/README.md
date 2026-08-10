@@ -23,8 +23,9 @@ sonic-sairedis and sonic-dash-api. The sairedis artifact carries its own
 common-libs, VPP, packages, and the canonical Redis test configuration.
 
 For Test scope, `packages/test.yaml` and the test-scoped artifact entries set up
-the Ubuntu VS-test host. The swss-owned `run-vs-tests-template.yml` consumes the
-same configuration for all three dataplane repositories.
+the Ubuntu VS-test host. The swss-owned
+`test-docker-sonic-vs-template.yml` consumes the same configuration for all
+three dataplane repositories.
 
 ## CI
 
