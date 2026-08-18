@@ -12,12 +12,6 @@ upstream:
     scopes: [build]
     cascade_optional: false
     result_filter: [succeeded, partiallySucceeded]
-    # libsaivs depends on VPP. The nested sairedis bundle declares VPP with this
-    # install environment; use the same signature here so buildenv_setup groups
-    # both artifacts into ONE dpkg invocation. dpkg unpacks the complete set,
-    # then configures VPP before its libsaivs dependents.
-    install_env: { VPP_INSTALL_SKIP_SYSCTL: "1" }
-    apt_fix_broken: true
     artifact_name:
       - { when: { arch: amd64 },          value: 'sonic-sairedis-{debian_version}' }
       - { when: { arch: { not: amd64 } }, value: 'sonic-sairedis-{debian_version}.{arch}' }
