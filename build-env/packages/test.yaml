@@ -32,3 +32,16 @@ packages:
   - python3-dev
   - uuid-dev
   - parallel
+
+post_install:
+  # The cascaded Redis hook restarts redis-server after libswsscommon installs
+  # its runtime DB config, and the service recreates /run/redis. Restore the
+  # canonical config from the matching swss-common source clone used to run
+  # buildenv_setup. This avoids duplicating the file in sonic-swss.
+  - name: restore-sonic-db-config
+    script: |
+      sudo install -d -m 755 /var/run/redis/sonic-db
+      sudo install -m 644 \
+        /tmp/sw-common/common/database_config.json \
+        /var/run/redis/sonic-db/database_config.json
+    scopes: [test]
