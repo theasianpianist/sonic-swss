@@ -273,5 +273,8 @@ jobs:
     continueOnError: true
 
   - script: |
-      sudo apt-get -o DPkg::Lock::Timeout=600 install -y python-is-python3
-    displayName: "Install temporary Python 3 compatibility symlink"
+      if ! command -v python >/dev/null 2>&1; then
+        sudo ln -s "$(command -v python3)" /usr/local/bin/python
+      fi
+      python --version
+    displayName: "Provide Python 3 compatibility symlink"
