@@ -25,6 +25,35 @@ extern redisReply *mockReply;
 
 namespace vnetorch_test
 {
+    // Free the hand-built pattern-message reply tree assigned to the global
+    // mockReply. redisGetReply() hands the notification consumer a *deep copy*
+    // (mock_hiredis.cpp), so the mock never takes ownership of this original --
+    // clearing the pointer without freeing leaks the tree (array + element structs
+    // + their strings) on every injected notification. free(nullptr) is a no-op,
+    // so the unset array slots / top-level str are handled safely.
+    static void freeMockReply()
+    {
+        if (mockReply == nullptr)
+        {
+            return;
+        }
+        if (mockReply->element != nullptr)
+        {
+            for (size_t i = 0; i < mockReply->elements; i++)
+            {
+                if (mockReply->element[i] != nullptr)
+                {
+                    free(mockReply->element[i]->str);
+                    free(mockReply->element[i]);
+                }
+            }
+            free(mockReply->element);
+        }
+        free(mockReply->str);
+        free(mockReply);
+        mockReply = nullptr;
+    }
+
     // VNetOrch programs a SAI virtual router per (non-default-scope) VNET via
     // create/set/remove with no bulk ops, so the WITH_SET generic mock variant
     // fits (same shape as sai_policer_api).
@@ -1530,7 +1559,7 @@ namespace vnetorch_test
             auto consumer = exec->getNotificationConsumer();
             consumer->readData();
             static_cast<Orch *>(gBfdOrch)->doTask(*consumer);
-            mockReply = nullptr;
+            freeMockReply();
 
             // gBfdOrch mirrored the new state into STATE_DB BFD_SESSION_TABLE. On
             // a real switch a keyspace notification wakes gBfdMonitorOrch, which
@@ -1987,7 +2016,7 @@ namespace vnetorch_test
             auto consumer = exec->getNotificationConsumer();
             consumer->readData();
             static_cast<Orch *>(gPortsOrch)->doTask(*consumer);
-            mockReply = nullptr;
+            freeMockReply();
         }
 
         // Bind a router interface to a VNET, standing in for the VS
