@@ -26,9 +26,11 @@ RUN apt-get update
 # VPP maintainer scripts invoke sysctl operations that docker build cannot
 # perform. Consumers that do not include VPP skip this block entirely.
 RUN if [ "$include_vpp" = "y" ]; then \
+        set -- /debs/*vpp*.deb; \
+        [ -e "$1" ] || { echo "include_vpp=y but no VPP DEBs were staged" >&2; exit 1; }; \
         cp /usr/sbin/sysctl /usr/sbin/sysctl.org; \
         cp /usr/bin/true /usr/sbin/sysctl; \
-        apt install -y $(ls /debs/*.deb | grep vpp); \
+        apt install -y "$@"; \
         mv /usr/sbin/sysctl.org /usr/sbin/sysctl; \
     fi
 

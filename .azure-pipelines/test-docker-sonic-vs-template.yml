@@ -78,7 +78,7 @@ jobs:
   - script: |
       set -ex
       ip a show dev eth0 || true
-      ls -A1 | xargs -r -I{} sudo rm -rf {}
+      find . -mindepth 1 -maxdepth 1 -exec sudo rm -rf -- {} +
       sudo apt-get purge -y libswsscommon python3-swsscommon || true
     displayName: "Clean workspace"
 
