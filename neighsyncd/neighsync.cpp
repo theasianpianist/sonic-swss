@@ -21,6 +21,7 @@ using namespace swss;
 
 NeighSync::NeighSync(RedisPipeline *pipelineAppDB, DBConnector *stateDb, DBConnector *cfgDb) :
     m_neighTable(pipelineAppDB, APP_NEIGH_TABLE_NAME),
+    m_kernelFailedNeighTable(pipelineAppDB, APP_KERNEL_FAILED_NEIGH_TABLE_NAME),
     m_stateNeighRestoreTable(stateDb, STATE_NEIGH_RESTORE_TABLE_NAME),
     m_cfgInterfaceTable(cfgDb, CFG_INTF_TABLE_NAME),
     m_cfgLagInterfaceTable(cfgDb, CFG_LAG_INTF_TABLE_NAME),
@@ -121,6 +122,17 @@ void NeighSync::onMsg(int nlmsg_type, struct nl_object *obj)
             SWSS_LOG_INFO("NOARP address received, ignoring for %s", ipStr);
             return;
         }
+    }
+
+    SWSS_LOG_INFO("Get neighbor msg %s, state %d, type %d", ipStr, state, nlmsg_type);
+
+    if (is_dualtor && family == IPV6_NAME && state == NUD_FAILED && nlmsg_type == RTM_NEWNEIGH)
+    {
+        std::vector<FieldValueTuple> failedNeighFields = {
+            FieldValueTuple("family", family),
+        };
+        m_kernelFailedNeighTable.set(key, failedNeighFields);
+        SWSS_LOG_NOTICE("Published failed kernel neighbor '%s' for nbrmgrd processing", key.c_str());
     }
 
     bool delete_key = false;
