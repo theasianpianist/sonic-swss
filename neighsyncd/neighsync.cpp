@@ -26,7 +26,7 @@ using namespace swss;
 
 NeighSync::NeighSync(RedisPipeline *pipelineAppDB, DBConnector *stateDb, DBConnector *cfgDb, DBConnector *appDb) :
     m_neighTable(pipelineAppDB, APP_NEIGH_TABLE_NAME),
-    m_kernelFailedNeighTable(pipelineAppDB, APP_KERNEL_FAILED_NEIGH_TABLE_NAME),
+    m_kernelFailedNeighTable(pipelineAppDB, APP_NEIGH_FAILED_TABLE_NAME),
     m_routeTable(pipelineAppDB, APP_ROUTE_TABLE_NAME, false),
     m_routeCheckTable(appDb, APP_ROUTE_TABLE_NAME),
     m_stateNeighRestoreTable(stateDb, STATE_NEIGH_RESTORE_TABLE_NAME),

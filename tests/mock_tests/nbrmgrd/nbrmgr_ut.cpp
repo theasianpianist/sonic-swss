@@ -143,13 +143,13 @@ namespace nbrmgr_ut
 
         void addFailedNeighborRequest(const std::string &key, const std::string &family = IPV6_NAME)
         {
-            swss::Table failedNeighTable(m_app_db.get(), APP_KERNEL_FAILED_NEIGH_TABLE_NAME);
+            swss::Table failedNeighTable(m_app_db.get(), APP_NEIGH_FAILED_TABLE_NAME);
             failedNeighTable.set(key, {{"family", family}});
         }
 
         void expectFailedNeighborTableEmpty()
         {
-            swss::Table failedNeighTable(m_app_db.get(), APP_KERNEL_FAILED_NEIGH_TABLE_NAME);
+            swss::Table failedNeighTable(m_app_db.get(), APP_NEIGH_FAILED_TABLE_NAME);
             std::vector<std::string> keys;
             failedNeighTable.getKeys(keys);
             EXPECT_TRUE(keys.empty());
