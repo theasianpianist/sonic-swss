@@ -68,10 +68,6 @@ parameters:
   type: boolean
   default: true
 
-- name: include_nexthopgroup
-  type: boolean
-  default: false
-
 - name: asan
   type: boolean
   default: false
@@ -187,19 +183,6 @@ jobs:
         path: $(Build.ArtifactStagingDirectory)/download
       displayName: "Download VPP artifacts"
 
-  - ${{ if eq(parameters.include_nexthopgroup, true) }}:
-    - task: DownloadPipelineArtifact@2
-      inputs:
-        source: specific
-        project: build
-        pipeline: Azure.sonic-buildimage.common_libs
-        artifact: common-lib
-        runVersion: latestFromBranch
-        runBranch: refs/heads/$(BUILD_BRANCH)
-        path: $(Build.ArtifactStagingDirectory)/download
-        patterns: '**/target/debs/${{ parameters.debian_version }}/libnexthopgroup_*.deb'
-      displayName: "Download libnexthopgroup"
-
   - script: |
       set -ex
       echo $(Build.DefinitionName).$(Build.BuildNumber)
@@ -210,7 +193,6 @@ jobs:
       mkdir -p .azure-pipelines/docker-sonic-vs/debs
       find $(Build.ArtifactStagingDirectory)/download/sairedis -name '*.deb' -exec cp -v "{}" .azure-pipelines/docker-sonic-vs/debs \;
       find $(Build.ArtifactStagingDirectory)/download -maxdepth 1 -name '*.deb' -exec cp -v "{}" .azure-pipelines/docker-sonic-vs/debs \;
-      find $(Build.ArtifactStagingDirectory)/download -name 'libnexthopgroup_*.deb' -exec cp -v "{}" .azure-pipelines/docker-sonic-vs/debs \;
 
       if [ '${{ parameters.include_gcov }}' == True ] && [ -f $(Build.ArtifactStagingDirectory)/download/coverage.info ]; then
         cp -v $(Build.ArtifactStagingDirectory)/download/coverage.info $(Build.ArtifactStagingDirectory)/
@@ -226,7 +208,6 @@ jobs:
       build_args="$build_args --build-arg debug_pkg=${{ parameters.debug_pkg }}"
       build_args="$build_args --build-arg include_gcov=$([ '${{ parameters.include_gcov }}' == True ] && echo y || echo n)"
       build_args="$build_args --build-arg include_vpp=$([ '${{ parameters.include_vpp }}' == True ] && echo y || echo n)"
-      build_args="$build_args --build-arg include_nexthopgroup=$([ '${{ parameters.include_nexthopgroup }}' == True ] && echo y || echo n)"
       if [ '${{ parameters.asan }}' == True ]; then
         build_args="$build_args --build-arg need_dbg=y"
       fi

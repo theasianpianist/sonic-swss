@@ -6,7 +6,6 @@ ARG debug_pkg=swss-dbg
 ARG build_dir
 ARG include_gcov=y
 ARG include_vpp=y
-ARG include_nexthopgroup=n
 ENV BUILD_DIR=$build_dir
 
 COPY ["debs", "/debs"]
@@ -17,9 +16,6 @@ RUN dpkg --remove --force-all libswsscommon
 RUN apt --fix-broken install -y
 RUN dpkg --purge python3-swsscommon sonic-db-cli libsaimetadata libsairedis \
         libsaivs syncd-vs swss sonic-eventd libdashapi framework
-RUN if [ "$include_nexthopgroup" = "y" ]; then \
-        dpkg --purge libnexthopgroup || true; \
-    fi
 
 RUN apt-get update
 
@@ -40,10 +36,6 @@ RUN apt install -y /debs/libdashapi_1.0.0_amd64.deb \
             /debs/libsaivs_1.0.0_amd64.deb \
             /debs/syncd-vs_1.0.0_amd64.deb \
             /debs/swss_1.0.0_amd64.deb
-
-RUN if [ "$include_nexthopgroup" = "y" ]; then \
-        apt install -y /debs/libnexthopgroup_1.0.0_amd64.deb; \
-    fi
 
 RUN if [ "$need_dbg" = "y" ]; then \
         dpkg -i "/debs/${debug_pkg}_1.0.0_amd64.deb"; \
