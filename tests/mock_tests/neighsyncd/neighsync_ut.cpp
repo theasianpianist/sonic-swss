@@ -92,7 +92,7 @@ class NeighSyncTest : public ::testing::Test
 
     bool failedNeighborExists(const std::string& ip)
     {
-        Table failedNeighborTable(m_appDb.get(), APP_KERNEL_FAILED_NEIGH_TABLE_NAME);
+        Table failedNeighborTable(m_appDb.get(), APP_NEIGH_FAILED_TABLE_NAME);
         std::vector<std::string> keys;
         failedNeighborTable.getKeys(keys);
         const std::string suffix = ":" + ip;

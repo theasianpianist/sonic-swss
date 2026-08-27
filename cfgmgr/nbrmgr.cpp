@@ -48,7 +48,7 @@ static bool send_message(struct nl_sock *sk, struct nl_msg *msg)
 
 NbrMgr::NbrMgr(DBConnector *cfgDb, DBConnector *appDb, DBConnector *stateDb, const vector<string> &tableNames) :
         Orch(cfgDb, tableNames),
-        m_kernelFailedNeighTable(appDb, APP_KERNEL_FAILED_NEIGH_TABLE_NAME),
+        m_kernelFailedNeighTable(appDb, APP_NEIGH_FAILED_TABLE_NAME),
         m_statePortTable(stateDb, STATE_PORT_TABLE_NAME),
         m_stateLagTable(stateDb, STATE_LAG_TABLE_NAME),
         m_stateVlanTable(stateDb, STATE_VLAN_TABLE_NAME),
@@ -73,9 +73,9 @@ NbrMgr::NbrMgr(DBConnector *cfgDb, DBConnector *appDb, DBConnector *stateDb, con
     Orch::addExecutor(consumer);
 
     auto failedNeighConsumerStateTable = new swss::ConsumerStateTable(
-        appDb, APP_KERNEL_FAILED_NEIGH_TABLE_NAME, TableConsumable::DEFAULT_POP_BATCH_SIZE, default_orch_pri);
+        appDb, APP_NEIGH_FAILED_TABLE_NAME, TableConsumable::DEFAULT_POP_BATCH_SIZE, default_orch_pri);
     auto failedNeighConsumer = new Consumer(
-        failedNeighConsumerStateTable, this, APP_KERNEL_FAILED_NEIGH_TABLE_NAME);
+        failedNeighConsumerStateTable, this, APP_NEIGH_FAILED_TABLE_NAME);
     Orch::addExecutor(failedNeighConsumer);
 
     /* Reconcile any pending entries in NEIGH_RESOLVE_TABLE from before restart */
@@ -622,7 +622,7 @@ void NbrMgr::doTask(Consumer &consumer)
     } else if (table_name == APP_NEIGH_RESOLVE_TABLE_NAME)
     {
         doResolveNeighTask(consumer);
-    } else if (table_name == APP_KERNEL_FAILED_NEIGH_TABLE_NAME)
+    } else if (table_name == APP_NEIGH_FAILED_TABLE_NAME)
     {
         doKernelFailedNeighTask(consumer);
     } else if(table_name == STATE_SYSTEM_NEIGH_TABLE_NAME)
