@@ -28,10 +28,7 @@ RUN apt-get update
 RUN if [ "$include_vpp" = "y" ]; then \
         set -- /debs/*vpp*.deb; \
         [ -e "$1" ] || { echo "include_vpp=y but no VPP DEBs were staged" >&2; exit 1; }; \
-        cp /usr/sbin/sysctl /usr/sbin/sysctl.org; \
-        cp /usr/bin/true /usr/sbin/sysctl; \
-        apt install -y "$@"; \
-        mv /usr/sbin/sysctl.org /usr/sbin/sysctl; \
+        VPP_INSTALL_SKIP_SYSCTL=1 apt install -y "$@"; \
     fi
 
 RUN apt install -y /debs/libdashapi_1.0.0_amd64.deb \
