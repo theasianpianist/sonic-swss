@@ -197,7 +197,7 @@ jobs:
         runVersion: latestFromBranch
         runBranch: refs/heads/$(BUILD_BRANCH)
         path: $(Build.ArtifactStagingDirectory)/download
-        patterns: '**/target/debs/*/libnexthopgroup_*.deb'
+        patterns: '**/target/debs/${{ parameters.debian_version }}/libnexthopgroup_*.deb'
       displayName: "Download libnexthopgroup"
 
   - script: |
