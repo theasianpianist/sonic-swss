@@ -26,6 +26,7 @@ using namespace swss;
 
 NeighSync::NeighSync(RedisPipeline *pipelineAppDB, DBConnector *stateDb, DBConnector *cfgDb, DBConnector *appDb) :
     m_neighTable(pipelineAppDB, APP_NEIGH_TABLE_NAME),
+    m_kernelFailedNeighTable(pipelineAppDB, APP_KERNEL_FAILED_NEIGH_TABLE_NAME),
     m_routeTable(pipelineAppDB, APP_ROUTE_TABLE_NAME, false),
     m_routeCheckTable(appDb, APP_ROUTE_TABLE_NAME),
     m_stateNeighRestoreTable(stateDb, STATE_NEIGH_RESTORE_TABLE_NAME),
@@ -249,6 +250,15 @@ void NeighSync::onMsg(int nlmsg_type, struct nl_object *obj)
     }
 
     SWSS_LOG_INFO("Get neighbor msg %s, state %d, type %d", ipStr, state, nlmsg_type);
+
+    if (is_dualtor && family == IPV6_NAME && state == NUD_FAILED && nlmsg_type == RTM_NEWNEIGH)
+    {
+        std::vector<FieldValueTuple> failedNeighFields = {
+            FieldValueTuple("family", family),
+        };
+        m_kernelFailedNeighTable.set(key, failedNeighFields);
+        SWSS_LOG_NOTICE("Published failed kernel neighbor '%s' for nbrmgrd processing", key.c_str());
+    }
 
     bool delete_key = false;
     bool use_zero_mac = false;

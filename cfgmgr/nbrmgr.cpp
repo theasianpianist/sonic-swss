@@ -2,7 +2,10 @@
 #include <netinet/in.h>
 #include <net/if.h>
 #include <unistd.h>
+#include <linux/neighbour.h>
+#include <netlink/addr.h>
 #include <netlink/cache.h>
+#include <netlink/route/neighbour.h>
 
 #include "logger.h"
 #include "tokenize.h"
@@ -14,6 +17,8 @@
 #include "subscriberstatetable.h"
 
 using namespace swss;
+
+static constexpr const char *NDISC6_CMD = "/usr/bin/ndisc6";
 
 static bool send_message(struct nl_sock *sk, struct nl_msg *msg)
 {
@@ -43,6 +48,7 @@ static bool send_message(struct nl_sock *sk, struct nl_msg *msg)
 
 NbrMgr::NbrMgr(DBConnector *cfgDb, DBConnector *appDb, DBConnector *stateDb, const vector<string> &tableNames) :
         Orch(cfgDb, tableNames),
+        m_kernelFailedNeighTable(appDb, APP_KERNEL_FAILED_NEIGH_TABLE_NAME),
         m_statePortTable(stateDb, STATE_PORT_TABLE_NAME),
         m_stateLagTable(stateDb, STATE_LAG_TABLE_NAME),
         m_stateVlanTable(stateDb, STATE_VLAN_TABLE_NAME),
@@ -66,8 +72,15 @@ NbrMgr::NbrMgr(DBConnector *cfgDb, DBConnector *appDb, DBConnector *stateDb, con
     auto consumer = new Consumer(consumerStateTable, this, APP_NEIGH_RESOLVE_TABLE_NAME);
     Orch::addExecutor(consumer);
 
+    auto failedNeighConsumerStateTable = new swss::ConsumerStateTable(
+        appDb, APP_KERNEL_FAILED_NEIGH_TABLE_NAME, TableConsumable::DEFAULT_POP_BATCH_SIZE, default_orch_pri);
+    auto failedNeighConsumer = new Consumer(
+        failedNeighConsumerStateTable, this, APP_KERNEL_FAILED_NEIGH_TABLE_NAME);
+    Orch::addExecutor(failedNeighConsumer);
+
     /* Reconcile any pending entries in NEIGH_RESOLVE_TABLE from before restart */
     reconcileNeighResolveTable(appDb);
+    reconcileKernelFailedNeighTable();
 
     string swtype;
     Table cfgDeviceMetaDataTable(cfgDb, CFG_DEVICE_METADATA_TABLE_NAME);
@@ -208,6 +221,188 @@ bool NbrMgr::setNeighbor(const string& alias, const IpAddress& ip, const MacAddr
     return send_message(m_nl_sock, msg);
 }
 
+bool NbrMgr::isFailedNeighbor(const string& alias, const IpAddress& ip)
+{
+    if (!m_nl_sock)
+    {
+        SWSS_LOG_ERROR("Cannot query failed neighbor '%s': netlink socket is unavailable",
+                       ip.to_string().c_str());
+        return false;
+    }
+
+    unsigned int ifindex = if_nametoindex(alias.c_str());
+    if (ifindex == 0)
+    {
+        SWSS_LOG_ERROR("Cannot query failed neighbor '%s': interface '%s' does not exist",
+                       ip.to_string().c_str(), alias.c_str());
+        return false;
+    }
+
+    struct nl_addr *dst = nullptr;
+    int err = nl_addr_parse(ip.to_string().c_str(), AF_INET6, &dst);
+    if (err < 0)
+    {
+        SWSS_LOG_ERROR("Failed to parse IPv6 neighbor '%s': %s",
+                       ip.to_string().c_str(), nl_geterror(err));
+        return false;
+    }
+
+    struct nl_cache *cache = nullptr;
+    err = rtnl_neigh_alloc_cache(m_nl_sock, &cache);
+    if (err < 0 || !cache)
+    {
+        SWSS_LOG_ERROR("Failed to read kernel neighbors for '%s': %s",
+                       ip.to_string().c_str(), nl_geterror(err));
+        nl_addr_put(dst);
+        return false;
+    }
+
+    struct rtnl_neigh *neigh = rtnl_neigh_get(cache, static_cast<int>(ifindex), dst);
+    bool isFailed = neigh && rtnl_neigh_get_state(neigh) == NUD_FAILED;
+
+    if (neigh)
+    {
+        rtnl_neigh_put(neigh);
+    }
+    nl_cache_free(cache);
+    nl_addr_put(dst);
+
+    return isFailed;
+}
+
+bool NbrMgr::setFailedNeighborIncomplete(const string& alias, const IpAddress& ip)
+{
+    SWSS_LOG_ENTER();
+
+    struct nl_msg *msg = nlmsg_alloc();
+    if (!msg)
+    {
+        SWSS_LOG_ERROR("Netlink message alloc failed for '%s'", ip.to_string().c_str());
+        return false;
+    }
+
+    auto flags = (NLM_F_REQUEST | NLM_F_ACK | NLM_F_REPLACE);
+    struct nlmsghdr *hdr = nlmsg_put(msg, NL_AUTO_PORT, NL_AUTO_SEQ, RTM_NEWNEIGH, 0, flags);
+    if (!hdr)
+    {
+        SWSS_LOG_ERROR("Netlink message header alloc failed for '%s'", ip.to_string().c_str());
+        nlmsg_free(msg);
+        return false;
+    }
+
+    struct ndmsg *nd_msg = static_cast<struct ndmsg *>(
+        nlmsg_reserve(msg, sizeof(struct ndmsg), NLMSG_ALIGNTO));
+    if (!nd_msg)
+    {
+        SWSS_LOG_ERROR("Netlink ndmsg reserve failed for '%s'", ip.to_string().c_str());
+        nlmsg_free(msg);
+        return false;
+    }
+
+    memset(nd_msg, 0, sizeof(struct ndmsg));
+    nd_msg->ndm_ifindex = static_cast<int>(if_nametoindex(alias.c_str()));
+    if (nd_msg->ndm_ifindex == 0)
+    {
+        SWSS_LOG_ERROR("Interface '%s' does not exist for failed neighbor '%s'",
+                       alias.c_str(), ip.to_string().c_str());
+        nlmsg_free(msg);
+        return false;
+    }
+
+    auto ipAddr = ip.getIp();
+    auto addrLen = sizeof(struct in6_addr);
+    struct rtattr *rta = static_cast<struct rtattr *>(
+        nlmsg_reserve(msg, sizeof(struct rtattr) + addrLen, NLMSG_ALIGNTO));
+    if (!rta)
+    {
+        SWSS_LOG_ERROR("Netlink rtattr (IP) failed for '%s'", ip.to_string().c_str());
+        nlmsg_free(msg);
+        return false;
+    }
+
+    rta->rta_type = NDA_DST;
+    rta->rta_len = static_cast<short>(RTA_LENGTH(addrLen));
+    memcpy(RTA_DATA(rta), &ipAddr.ip_addr.ipv6_addr, addrLen);
+
+    nd_msg->ndm_family = AF_INET6;
+    nd_msg->ndm_type = RTN_UNICAST;
+    nd_msg->ndm_state = NUD_INCOMPLETE;
+
+    return send_message(m_nl_sock, msg);
+}
+
+bool NbrMgr::sendNeighborSolicitation(const string& alias, const IpAddress& ip)
+{
+    string command = string(NDISC6_CMD) + " -q -w 0 -1 " +
+                     shellquote(ip.to_string()) + " " + shellquote(alias);
+    string output;
+    int32_t result = swss::exec(command, output);
+    if (result != 0)
+    {
+        SWSS_LOG_WARN("Failed to send neighbor solicitation for '%s' on '%s', error: %d, output: %s",
+                      ip.to_string().c_str(), alias.c_str(), result, output.c_str());
+        return false;
+    }
+
+    return true;
+}
+
+void NbrMgr::processKernelFailedNeighbor(const string& key, const vector<FieldValueTuple>& data)
+{
+    try
+    {
+        string family;
+        for (const auto& fieldValue : data)
+        {
+            if (fvField(fieldValue) == "family")
+            {
+                family = fvValue(fieldValue);
+                break;
+            }
+        }
+
+        string tableSeparator = m_kernelFailedNeighTable.getTableNameSeparator();
+        if (family != IPV6_NAME || key.find(tableSeparator) == string::npos)
+        {
+            SWSS_LOG_ERROR("Invalid failed kernel neighbor entry '%s' with family '%s'",
+                           key.c_str(), family.c_str());
+        }
+        else
+        {
+            vector<string> parsedKeys = parseAliasIp(key, tableSeparator.c_str());
+            string alias(parsedKeys[0]);
+            IpAddress ip(parsedKeys[1]);
+
+            if (ip.isV4())
+            {
+                SWSS_LOG_ERROR("Ignoring non-IPv6 failed kernel neighbor '%s'", key.c_str());
+            }
+            else if (!isFailedNeighbor(alias, ip))
+            {
+                SWSS_LOG_NOTICE("Skipping stale failed kernel neighbor request '%s'", key.c_str());
+            }
+            else if (!setFailedNeighborIncomplete(alias, ip))
+            {
+                SWSS_LOG_ERROR("Failed to move kernel neighbor '%s' to INCOMPLETE", key.c_str());
+            }
+            else if (sendNeighborSolicitation(alias, ip))
+            {
+                SWSS_LOG_NOTICE("Moved kernel neighbor '%s' to INCOMPLETE and sent one NS", key.c_str());
+            }
+            else
+            {
+                SWSS_LOG_WARN("Moved kernel neighbor '%s' to INCOMPLETE but failed to send NS", key.c_str());
+            }
+        }
+    }
+    catch (const std::invalid_argument& e)
+    {
+        SWSS_LOG_ERROR("Failed to process kernel neighbor '%s': %s", key.c_str(), e.what());
+    }
+
+    m_kernelFailedNeighTable.del(key);
+}
+
 /**
  * Parse APPL_DB neighbors resolve table.
  *
@@ -281,6 +476,25 @@ void NbrMgr::reconcileNeighResolveTable(DBConnector *appDb)
     }
 }
 
+void NbrMgr::reconcileKernelFailedNeighTable()
+{
+    vector<string> keys;
+    m_kernelFailedNeighTable.getKeys(keys);
+
+    for (const auto& key : keys)
+    {
+        vector<FieldValueTuple> data;
+        if (!m_kernelFailedNeighTable.get(key, data))
+        {
+            SWSS_LOG_ERROR("Failed to read pending kernel neighbor '%s'", key.c_str());
+            m_kernelFailedNeighTable.del(key);
+            continue;
+        }
+
+        processKernelFailedNeighbor(key, data);
+    }
+}
+
 void NbrMgr::doResolveNeighTask(Consumer &consumer)
 {
     SWSS_LOG_ENTER();
@@ -306,6 +520,21 @@ void NbrMgr::doResolveNeighTask(Consumer &consumer)
         {
             SWSS_LOG_ERROR("Neigh entry resolve failed for '%s'", kfvKey(t).c_str());
         }
+        it = consumer.m_toSync.erase(it);
+    }
+}
+
+void NbrMgr::doKernelFailedNeighTask(Consumer& consumer)
+{
+    auto it = consumer.m_toSync.begin();
+    while (it != consumer.m_toSync.end())
+    {
+        KeyOpFieldsValuesTuple t = it->second;
+        if (kfvOp(t) == SET_COMMAND)
+        {
+            processKernelFailedNeighbor(kfvKey(t), kfvFieldsValues(t));
+        }
+
         it = consumer.m_toSync.erase(it);
     }
 }
@@ -393,6 +622,9 @@ void NbrMgr::doTask(Consumer &consumer)
     } else if (table_name == APP_NEIGH_RESOLVE_TABLE_NAME)
     {
         doResolveNeighTask(consumer);
+    } else if (table_name == APP_KERNEL_FAILED_NEIGH_TABLE_NAME)
+    {
+        doKernelFailedNeighTask(consumer);
     } else if(table_name == STATE_SYSTEM_NEIGH_TABLE_NAME)
     {
         doStateSystemNeighTask(consumer);
