@@ -399,8 +399,6 @@ void NbrMgr::processKernelFailedNeighbor(const string& key, const vector<FieldVa
     {
         SWSS_LOG_ERROR("Failed to process kernel neighbor '%s': %s", key.c_str(), e.what());
     }
-
-    m_kernelFailedNeighTable.del(key);
 }
 
 /**
@@ -487,7 +485,6 @@ void NbrMgr::reconcileKernelFailedNeighTable()
         if (!m_kernelFailedNeighTable.get(key, data))
         {
             SWSS_LOG_ERROR("Failed to read pending kernel neighbor '%s'", key.c_str());
-            m_kernelFailedNeighTable.del(key);
             continue;
         }
 

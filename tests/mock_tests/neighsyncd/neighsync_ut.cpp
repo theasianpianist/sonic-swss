@@ -149,23 +149,66 @@ TEST_F(NeighSyncTest, FiltersUnsupportedFailedNeighborEvents)
     ASSERT_TRUE(incomplete.get() != nullptr);
     m_sync->onMsg(RTM_NEWNEIGH, reinterpret_cast<struct nl_object *>(incomplete.get()));
 
-    auto deleted = createNeighbor(AF_INET6, "2001:db8::3", NUD_FAILED);
+    EXPECT_FALSE(failedNeighborExists("192.0.2.1"));
+    EXPECT_FALSE(failedNeighborExists("2001:db8::2"));
+}
+
+TEST_F(NeighSyncTest, KeepsFailedNeighborEntryWhileIncomplete)
+{
+    enableDualTor();
+    auto failed = createNeighbor(AF_INET6, "2001:db8::3", NUD_FAILED);
+    ASSERT_TRUE(failed.get() != nullptr);
+    m_sync->onMsg(RTM_NEWNEIGH, reinterpret_cast<struct nl_object *>(failed.get()));
+    ASSERT_TRUE(failedNeighborExists("2001:db8::3"));
+
+    auto incomplete = createNeighbor(AF_INET6, "2001:db8::3", NUD_INCOMPLETE);
+    ASSERT_TRUE(incomplete.get() != nullptr);
+    m_sync->onMsg(RTM_NEWNEIGH, reinterpret_cast<struct nl_object *>(incomplete.get()));
+
+    EXPECT_TRUE(failedNeighborExists("2001:db8::3"));
+}
+
+TEST_F(NeighSyncTest, RemovesFailedNeighborEntryWhenResolved)
+{
+    enableDualTor();
+    auto failed = createNeighbor(AF_INET6, "2001:db8::4", NUD_FAILED);
+    ASSERT_TRUE(failed.get() != nullptr);
+    m_sync->onMsg(RTM_NEWNEIGH, reinterpret_cast<struct nl_object *>(failed.get()));
+    ASSERT_TRUE(failedNeighborExists("2001:db8::4"));
+
+    Table peerSwitchTable(m_configDb.get(), CFG_PEER_SWITCH_TABLE_NAME);
+    peerSwitchTable.del("peer_switch_hostname");
+
+    auto reachable = createNeighbor(AF_INET6, "2001:db8::4", NUD_REACHABLE);
+    ASSERT_TRUE(reachable.get() != nullptr);
+    m_sync->onMsg(RTM_NEWNEIGH, reinterpret_cast<struct nl_object *>(reachable.get()));
+
+    EXPECT_FALSE(failedNeighborExists("2001:db8::4"));
+}
+
+TEST_F(NeighSyncTest, RemovesFailedNeighborEntryWhenDeleted)
+{
+    enableDualTor();
+    auto failed = createNeighbor(AF_INET6, "2001:db8::5", NUD_FAILED);
+    ASSERT_TRUE(failed.get() != nullptr);
+    m_sync->onMsg(RTM_NEWNEIGH, reinterpret_cast<struct nl_object *>(failed.get()));
+    ASSERT_TRUE(failedNeighborExists("2001:db8::5"));
+
+    auto deleted = createNeighbor(AF_INET6, "2001:db8::5", NUD_FAILED);
     ASSERT_TRUE(deleted.get() != nullptr);
     m_sync->onMsg(RTM_DELNEIGH, reinterpret_cast<struct nl_object *>(deleted.get()));
 
-    EXPECT_FALSE(failedNeighborExists("192.0.2.1"));
-    EXPECT_FALSE(failedNeighborExists("2001:db8::2"));
-    EXPECT_FALSE(failedNeighborExists("2001:db8::3"));
+    EXPECT_FALSE(failedNeighborExists("2001:db8::5"));
 }
 
 TEST_F(NeighSyncTest, DoesNotPublishFailedIpv6NeighborWithoutDualTor)
 {
-    auto neigh = createNeighbor(AF_INET6, "2001:db8::4", NUD_FAILED);
+    auto neigh = createNeighbor(AF_INET6, "2001:db8::6", NUD_FAILED);
     ASSERT_TRUE(neigh.get() != nullptr);
 
     m_sync->onMsg(RTM_NEWNEIGH, reinterpret_cast<struct nl_object *>(neigh.get()));
 
-    EXPECT_FALSE(failedNeighborExists("2001:db8::4"));
+    EXPECT_FALSE(failedNeighborExists("2001:db8::6"));
 }
 
 } // namespace

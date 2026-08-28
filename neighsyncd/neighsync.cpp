@@ -24,11 +24,15 @@ using namespace swss;
 #define TENMS                   10000
 #define MAX_ROUTE_DEL_RETRY     100
 
+static constexpr int RESOLVED_NEIGH_STATES =
+    NUD_PERMANENT | NUD_NOARP | NUD_REACHABLE | NUD_PROBE | NUD_STALE | NUD_DELAY;
+
 NeighSync::NeighSync(RedisPipeline *pipelineAppDB, DBConnector *stateDb, DBConnector *cfgDb, DBConnector *appDb) :
     m_neighTable(pipelineAppDB, APP_NEIGH_TABLE_NAME),
     m_kernelFailedNeighTable(pipelineAppDB, APP_NEIGH_FAILED_TABLE_NAME),
     m_routeTable(pipelineAppDB, APP_ROUTE_TABLE_NAME, false),
     m_routeCheckTable(appDb, APP_ROUTE_TABLE_NAME),
+    m_kernelFailedNeighCheckTable(appDb, APP_NEIGH_FAILED_TABLE_NAME),
     m_stateNeighRestoreTable(stateDb, STATE_NEIGH_RESTORE_TABLE_NAME),
     m_cfgInterfaceTable(cfgDb, CFG_INTF_TABLE_NAME),
     m_cfgLagInterfaceTable(cfgDb, CFG_LAG_INTF_TABLE_NAME),
@@ -232,6 +236,30 @@ void NeighSync::onMsg(int nlmsg_type, struct nl_object *obj)
     key+= ipStr;
 
     int state = rtnl_neigh_get_state(neigh);
+    if (family == IPV6_NAME)
+    {
+        if (is_dualtor && nlmsg_type == RTM_NEWNEIGH && state == NUD_FAILED)
+        {
+            std::vector<FieldValueTuple> failedNeighFields = {
+                FieldValueTuple("family", family),
+            };
+            m_kernelFailedNeighTable.set(key, failedNeighFields);
+            SWSS_LOG_NOTICE("Published failed kernel neighbor '%s' for nbrmgrd processing", key.c_str());
+        }
+        else if (nlmsg_type == RTM_DELNEIGH ||
+                 ((nlmsg_type == RTM_NEWNEIGH || nlmsg_type == RTM_GETNEIGH) &&
+                  (state & RESOLVED_NEIGH_STATES)))
+        {
+            std::vector<FieldValueTuple> failedNeighFields;
+            if (m_kernelFailedNeighCheckTable.get(key, failedNeighFields))
+            {
+                m_kernelFailedNeighTable.del(key);
+                SWSS_LOG_NOTICE("Removed resolved or deleted kernel neighbor '%s' from failed neighbor table",
+                                key.c_str());
+            }
+        }
+    }
+
     /* Ignore probe msg (EVPN only) */
     if (m_isEvpnNvoExist && (nlmsg_type == RTM_NEWNEIGH) && (state == NUD_PROBE))
     {
@@ -250,15 +278,6 @@ void NeighSync::onMsg(int nlmsg_type, struct nl_object *obj)
     }
 
     SWSS_LOG_INFO("Get neighbor msg %s, state %d, type %d", ipStr, state, nlmsg_type);
-
-    if (is_dualtor && family == IPV6_NAME && state == NUD_FAILED && nlmsg_type == RTM_NEWNEIGH)
-    {
-        std::vector<FieldValueTuple> failedNeighFields = {
-            FieldValueTuple("family", family),
-        };
-        m_kernelFailedNeighTable.set(key, failedNeighFields);
-        SWSS_LOG_NOTICE("Published failed kernel neighbor '%s' for nbrmgrd processing", key.c_str());
-    }
 
     bool delete_key = false;
     bool use_zero_mac = false;
