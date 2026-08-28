@@ -32,10 +32,6 @@ parameters:
 - name: artifact_name
   type: string
 
-- name: debian_version
-  type: string
-  default: bookworm
-
 - name: vpp_artifact_name
   type: string
   default: vpp-bookworm
@@ -165,9 +161,7 @@ jobs:
       runVersion: latestFromBranch
       runBranch: refs/heads/${{ parameters.buildimage_artifact_branch }}
       path: $(Build.ArtifactStagingDirectory)/download
-      patterns: |
-        **/target/${{ parameters.artifact_name }}.gz
-        **/target/debs/${{ parameters.debian_version }}/framework_*.deb
+      patterns: '**/target/${{ parameters.artifact_name }}.gz'
     displayName: "Download base ${{ parameters.artifact_name }} image"
 
   - ${{ if eq(parameters.include_vpp, true) }}:
