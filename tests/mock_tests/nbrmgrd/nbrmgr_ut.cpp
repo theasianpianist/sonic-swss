@@ -147,12 +147,11 @@ namespace nbrmgr_ut
             failedNeighTable.set(key, {{"family", family}});
         }
 
-        void expectFailedNeighborTableEmpty()
+        void expectFailedNeighborEntry(const std::string& key)
         {
             swss::Table failedNeighTable(m_app_db.get(), APP_NEIGH_FAILED_TABLE_NAME);
-            std::vector<std::string> keys;
-            failedNeighTable.getKeys(keys);
-            EXPECT_TRUE(keys.empty());
+            std::vector<swss::FieldValueTuple> values;
+            EXPECT_TRUE(failedNeighTable.get(key, values));
         }
     };
 
@@ -285,10 +284,10 @@ namespace nbrmgr_ut
         ASSERT_EQ(mockCallArgs.size(), 1u);
         EXPECT_EQ(mockCallArgs[0], "/usr/bin/ndisc6 -q -w 0 -1 \"2001:db8::1\" \"Vlan1000\"");
         EXPECT_EQ(operationOrder, (std::vector<std::string>{"netlink", "ndisc6"}));
-        expectFailedNeighborTableEmpty();
+        expectFailedNeighborEntry("Vlan1000:2001:db8::1");
     }
 
-    TEST_F(NbrMgrTest, NetlinkFailureSkipsSolicitationAndDeletesRequest)
+    TEST_F(NbrMgrTest, NetlinkFailureSkipsSolicitationAndKeepsRequest)
     {
         std::vector<std::string> cfg_nbr_tables = {CFG_NEIGH_TABLE_NAME};
         swss::NbrMgr nbrmgr(m_config_db.get(), m_app_db.get(), m_state_db.get(), cfg_nbr_tables);
@@ -300,10 +299,10 @@ namespace nbrmgr_ut
         ASSERT_EQ(capturedNeighborRequests.size(), 1u);
         EXPECT_TRUE(mockCallArgs.empty());
         EXPECT_EQ(operationOrder, (std::vector<std::string>{"netlink"}));
-        expectFailedNeighborTableEmpty();
+        expectFailedNeighborEntry("Vlan1000:2001:db8::2");
     }
 
-    TEST_F(NbrMgrTest, SolicitationFailureDeletesRequest)
+    TEST_F(NbrMgrTest, SolicitationFailureKeepsRequest)
     {
         std::vector<std::string> cfg_nbr_tables = {CFG_NEIGH_TABLE_NAME};
         swss::NbrMgr nbrmgr(m_config_db.get(), m_app_db.get(), m_state_db.get(), cfg_nbr_tables);
@@ -314,10 +313,10 @@ namespace nbrmgr_ut
 
         EXPECT_EQ(capturedNeighborRequests.size(), 1u);
         EXPECT_EQ(mockCallArgs.size(), 1u);
-        expectFailedNeighborTableEmpty();
+        expectFailedNeighborEntry("Vlan1000:2001:db8::3");
     }
 
-    TEST_F(NbrMgrTest, StaleNeighborDeletesRequestWithoutUpdate)
+    TEST_F(NbrMgrTest, StaleNeighborKeepsRequestWithoutUpdate)
     {
         std::vector<std::string> cfg_nbr_tables = {CFG_NEIGH_TABLE_NAME};
         swss::NbrMgr nbrmgr(m_config_db.get(), m_app_db.get(), m_state_db.get(), cfg_nbr_tables);
@@ -328,7 +327,7 @@ namespace nbrmgr_ut
 
         EXPECT_TRUE(capturedNeighborRequests.empty());
         EXPECT_TRUE(mockCallArgs.empty());
-        expectFailedNeighborTableEmpty();
+        expectFailedNeighborEntry("Vlan1000:2001:db8::4");
     }
 
     TEST_F(NbrMgrTest, RejectsIpv4FailedNeighborRequest)
@@ -341,7 +340,7 @@ namespace nbrmgr_ut
 
         EXPECT_TRUE(capturedNeighborRequests.empty());
         EXPECT_TRUE(mockCallArgs.empty());
-        expectFailedNeighborTableEmpty();
+        expectFailedNeighborEntry("Vlan1000:192.0.2.1");
     }
 
     TEST_F(NbrMgrTest, RejectsMalformedFailedNeighborRequest)
@@ -354,7 +353,7 @@ namespace nbrmgr_ut
 
         EXPECT_TRUE(capturedNeighborRequests.empty());
         EXPECT_TRUE(mockCallArgs.empty());
-        expectFailedNeighborTableEmpty();
+        expectFailedNeighborEntry("invalid-key");
     }
 
     TEST_F(NbrMgrTest, ReconcilesPendingFailedNeighborRequest)
@@ -366,7 +365,7 @@ namespace nbrmgr_ut
 
         EXPECT_EQ(capturedNeighborRequests.size(), 1u);
         EXPECT_EQ(mockCallArgs.size(), 1u);
-        expectFailedNeighborTableEmpty();
+        expectFailedNeighborEntry("Vlan1000:2001:db8::5");
     }
 
     TEST_F(NbrMgrTest, ExistingResolvePathStillUsesNtfUse)
