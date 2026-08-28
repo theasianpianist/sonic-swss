@@ -90,7 +90,7 @@ class NeighSyncTest : public ::testing::Test
         peerSwitchTable.set("peer_switch_hostname", {{"address_ipv4", "10.0.0.1"}});
     }
 
-    bool failedNeighborExists(const std::string& ip)
+    bool failedNeighborExists(const std::string& ip, std::vector<FieldValueTuple>* fields = nullptr)
     {
         Table failedNeighborTable(m_appDb.get(), APP_NEIGH_FAILED_TABLE_NAME);
         std::vector<std::string> keys;
@@ -102,9 +102,12 @@ class NeighSyncTest : public ::testing::Test
             std::vector<FieldValueTuple> values;
             if (key.size() >= suffix.size() &&
                 key.compare(key.size() - suffix.size(), suffix.size(), suffix) == 0 &&
-                failedNeighborTable.get(key, values) &&
-                fvsGetValue(values, "family", true).get() == IPV6_NAME)
+                failedNeighborTable.get(key, values))
             {
+                if (fields)
+                {
+                    *fields = values;
+                }
                 return true;
             }
         }
@@ -134,7 +137,11 @@ TEST_F(NeighSyncTest, PublishesDualTorFailedIpv6Neighbor)
 
     m_sync->onMsg(RTM_NEWNEIGH, reinterpret_cast<struct nl_object *>(neigh.get()));
 
-    EXPECT_TRUE(failedNeighborExists("2001:db8::1"));
+    std::vector<FieldValueTuple> fields;
+    ASSERT_TRUE(failedNeighborExists("2001:db8::1", &fields));
+    ASSERT_EQ(fields.size(), 1u);
+    EXPECT_EQ(fvField(fields[0]), "NULL");
+    EXPECT_EQ(fvValue(fields[0]), "NULL");
 }
 
 TEST_F(NeighSyncTest, FiltersUnsupportedFailedNeighborEvents)
