@@ -3,9 +3,7 @@
 #include <net/if.h>
 #include <unistd.h>
 #include <linux/neighbour.h>
-#include <netlink/addr.h>
-#include <netlink/cache.h>
-#include <netlink/route/neighbour.h>
+#include <netlink/msg.h>
 
 #include "logger.h"
 #include "tokenize.h"
@@ -221,55 +219,6 @@ bool NbrMgr::setNeighbor(const string& alias, const IpAddress& ip, const MacAddr
     return send_message(m_nl_sock, msg);
 }
 
-bool NbrMgr::isFailedNeighbor(const string& alias, const IpAddress& ip)
-{
-    if (!m_nl_sock)
-    {
-        SWSS_LOG_ERROR("Cannot query failed neighbor '%s': netlink socket is unavailable",
-                       ip.to_string().c_str());
-        return false;
-    }
-
-    unsigned int ifindex = if_nametoindex(alias.c_str());
-    if (ifindex == 0)
-    {
-        SWSS_LOG_ERROR("Cannot query failed neighbor '%s': interface '%s' does not exist",
-                       ip.to_string().c_str(), alias.c_str());
-        return false;
-    }
-
-    struct nl_addr *dst = nullptr;
-    int err = nl_addr_parse(ip.to_string().c_str(), AF_INET6, &dst);
-    if (err < 0)
-    {
-        SWSS_LOG_ERROR("Failed to parse IPv6 neighbor '%s': %s",
-                       ip.to_string().c_str(), nl_geterror(err));
-        return false;
-    }
-
-    struct nl_cache *cache = nullptr;
-    err = rtnl_neigh_alloc_cache(m_nl_sock, &cache);
-    if (err < 0 || !cache)
-    {
-        SWSS_LOG_ERROR("Failed to read kernel neighbors for '%s': %s",
-                       ip.to_string().c_str(), nl_geterror(err));
-        nl_addr_put(dst);
-        return false;
-    }
-
-    struct rtnl_neigh *neigh = rtnl_neigh_get(cache, static_cast<int>(ifindex), dst);
-    bool isFailed = neigh && rtnl_neigh_get_state(neigh) == NUD_FAILED;
-
-    if (neigh)
-    {
-        rtnl_neigh_put(neigh);
-    }
-    nl_cache_free(cache);
-    nl_addr_put(dst);
-
-    return isFailed;
-}
-
 bool NbrMgr::setFailedNeighborIncomplete(const string& alias, const IpAddress& ip)
 {
     SWSS_LOG_ENTER();
@@ -347,25 +296,14 @@ bool NbrMgr::sendNeighborSolicitation(const string& alias, const IpAddress& ip)
     return true;
 }
 
-void NbrMgr::processKernelFailedNeighbor(const string& key, const vector<FieldValueTuple>& data)
+void NbrMgr::processKernelFailedNeighbor(const string& key)
 {
     try
     {
-        string family;
-        for (const auto& fieldValue : data)
-        {
-            if (fvField(fieldValue) == "family")
-            {
-                family = fvValue(fieldValue);
-                break;
-            }
-        }
-
         string tableSeparator = m_kernelFailedNeighTable.getTableNameSeparator();
-        if (family != IPV6_NAME || key.find(tableSeparator) == string::npos)
+        if (key.find(tableSeparator) == string::npos)
         {
-            SWSS_LOG_ERROR("Invalid failed kernel neighbor entry '%s' with family '%s'",
-                           key.c_str(), family.c_str());
+            SWSS_LOG_ERROR("Invalid failed kernel neighbor entry '%s'", key.c_str());
         }
         else
         {
@@ -376,10 +314,6 @@ void NbrMgr::processKernelFailedNeighbor(const string& key, const vector<FieldVa
             if (ip.isV4())
             {
                 SWSS_LOG_ERROR("Ignoring non-IPv6 failed kernel neighbor '%s'", key.c_str());
-            }
-            else if (!isFailedNeighbor(alias, ip))
-            {
-                SWSS_LOG_NOTICE("Skipping stale failed kernel neighbor request '%s'", key.c_str());
             }
             else if (!setFailedNeighborIncomplete(alias, ip))
             {
@@ -488,7 +422,7 @@ void NbrMgr::reconcileKernelFailedNeighTable()
             continue;
         }
 
-        processKernelFailedNeighbor(key, data);
+        processKernelFailedNeighbor(key);
     }
 }
 
@@ -529,7 +463,7 @@ void NbrMgr::doKernelFailedNeighTask(Consumer& consumer)
         KeyOpFieldsValuesTuple t = it->second;
         if (kfvOp(t) == SET_COMMAND)
         {
-            processKernelFailedNeighbor(kfvKey(t), kfvFieldsValues(t));
+            processKernelFailedNeighbor(kfvKey(t));
         }
 
         it = consumer.m_toSync.erase(it);

@@ -27,10 +27,9 @@ private:
     void reconcileKernelFailedNeighTable();
     bool isIntfStateOk(const std::string &alias);
     bool setNeighbor(const std::string& alias, const IpAddress& ip, const MacAddress& mac);
-    bool isFailedNeighbor(const std::string& alias, const IpAddress& ip);
     bool setFailedNeighborIncomplete(const std::string& alias, const IpAddress& ip);
     bool sendNeighborSolicitation(const std::string& alias, const IpAddress& ip);
-    void processKernelFailedNeighbor(const std::string& key, const std::vector<FieldValueTuple>& data);
+    void processKernelFailedNeighbor(const std::string& key);
 
     vector<string> parseAliasIp(const string &app_db_nbr_tbl_key, const char *delimiter);
 

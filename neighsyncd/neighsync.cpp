@@ -241,7 +241,7 @@ void NeighSync::onMsg(int nlmsg_type, struct nl_object *obj)
         if (is_dualtor && nlmsg_type == RTM_NEWNEIGH && state == NUD_FAILED)
         {
             std::vector<FieldValueTuple> failedNeighFields = {
-                FieldValueTuple("family", family),
+                FieldValueTuple("NULL", "NULL"),
             };
             m_kernelFailedNeighTable.set(key, failedNeighFields);
             SWSS_LOG_NOTICE("Published failed kernel neighbor '%s' for nbrmgrd processing", key.c_str());
