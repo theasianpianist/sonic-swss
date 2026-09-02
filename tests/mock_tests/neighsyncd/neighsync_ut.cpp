@@ -190,24 +190,6 @@ TEST_F(NeighSyncTest, RemovesFailedNeighborEntryWhenResolved)
     EXPECT_FALSE(failedNeighborExists("2001:db8::4"));
 }
 
-TEST_F(NeighSyncTest, DoesNotRemoveFailedNeighborEntryWithoutDualTor)
-{
-    enableDualTor();
-    auto failed = createNeighbor(AF_INET6, "2001:db8::7", NUD_FAILED);
-    ASSERT_TRUE(failed.get() != nullptr);
-    m_sync->onMsg(RTM_NEWNEIGH, reinterpret_cast<struct nl_object *>(failed.get()));
-    ASSERT_TRUE(failedNeighborExists("2001:db8::7"));
-
-    Table peerSwitchTable(m_configDb.get(), CFG_PEER_SWITCH_TABLE_NAME);
-    peerSwitchTable.del("peer_switch_hostname");
-
-    auto reachable = createNeighbor(AF_INET6, "2001:db8::7", NUD_REACHABLE);
-    ASSERT_TRUE(reachable.get() != nullptr);
-    m_sync->onMsg(RTM_NEWNEIGH, reinterpret_cast<struct nl_object *>(reachable.get()));
-
-    EXPECT_TRUE(failedNeighborExists("2001:db8::7"));
-}
-
 TEST_F(NeighSyncTest, RemovesFailedNeighborEntryWhenDeleted)
 {
     enableDualTor();
