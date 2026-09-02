@@ -236,9 +236,9 @@ void NeighSync::onMsg(int nlmsg_type, struct nl_object *obj)
     key+= ipStr;
 
     int state = rtnl_neigh_get_state(neigh);
-    if (family == IPV6_NAME)
+    if (is_dualtor && family == IPV6_NAME)
     {
-        if (is_dualtor && nlmsg_type == RTM_NEWNEIGH && state == NUD_FAILED)
+        if (nlmsg_type == RTM_NEWNEIGH && state == NUD_FAILED)
         {
             std::vector<FieldValueTuple> failedNeighFields = {
                 FieldValueTuple("NULL", "NULL"),
