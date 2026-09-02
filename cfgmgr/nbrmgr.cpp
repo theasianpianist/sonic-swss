@@ -46,7 +46,6 @@ static bool send_message(struct nl_sock *sk, struct nl_msg *msg)
 
 NbrMgr::NbrMgr(DBConnector *cfgDb, DBConnector *appDb, DBConnector *stateDb, const vector<string> &tableNames) :
         Orch(cfgDb, tableNames),
-        m_kernelFailedNeighTable(appDb, APP_NEIGH_FAILED_TABLE_NAME),
         m_statePortTable(stateDb, STATE_PORT_TABLE_NAME),
         m_stateLagTable(stateDb, STATE_LAG_TABLE_NAME),
         m_stateVlanTable(stateDb, STATE_VLAN_TABLE_NAME),
@@ -78,7 +77,6 @@ NbrMgr::NbrMgr(DBConnector *cfgDb, DBConnector *appDb, DBConnector *stateDb, con
 
     /* Reconcile any pending entries in NEIGH_RESOLVE_TABLE from before restart */
     reconcileNeighResolveTable(appDb);
-    reconcileKernelFailedNeighTable();
 
     string swtype;
     Table cfgDeviceMetaDataTable(cfgDb, CFG_DEVICE_METADATA_TABLE_NAME);
@@ -296,11 +294,10 @@ bool NbrMgr::sendNeighborSolicitation(const string& alias, const IpAddress& ip)
     return true;
 }
 
-void NbrMgr::processKernelFailedNeighbor(const string& key)
+void NbrMgr::processKernelFailedNeighbor(const string& key, const string& tableSeparator)
 {
     try
     {
-        string tableSeparator = m_kernelFailedNeighTable.getTableNameSeparator();
         if (key.find(tableSeparator) == string::npos)
         {
             SWSS_LOG_ERROR("Invalid failed kernel neighbor entry '%s'", key.c_str());
@@ -408,24 +405,6 @@ void NbrMgr::reconcileNeighResolveTable(DBConnector *appDb)
     }
 }
 
-void NbrMgr::reconcileKernelFailedNeighTable()
-{
-    vector<string> keys;
-    m_kernelFailedNeighTable.getKeys(keys);
-
-    for (const auto& key : keys)
-    {
-        vector<FieldValueTuple> data;
-        if (!m_kernelFailedNeighTable.get(key, data))
-        {
-            SWSS_LOG_ERROR("Failed to read pending kernel neighbor '%s'", key.c_str());
-            continue;
-        }
-
-        processKernelFailedNeighbor(key);
-    }
-}
-
 void NbrMgr::doResolveNeighTask(Consumer &consumer)
 {
     SWSS_LOG_ENTER();
@@ -457,13 +436,14 @@ void NbrMgr::doResolveNeighTask(Consumer &consumer)
 
 void NbrMgr::doKernelFailedNeighTask(Consumer& consumer)
 {
+    const string tableSeparator = consumer.getConsumerTable()->getTableNameSeparator();
     auto it = consumer.m_toSync.begin();
     while (it != consumer.m_toSync.end())
     {
         KeyOpFieldsValuesTuple t = it->second;
         if (kfvOp(t) == SET_COMMAND)
         {
-            processKernelFailedNeighbor(kfvKey(t));
+            processKernelFailedNeighbor(kfvKey(t), tableSeparator);
         }
 
         it = consumer.m_toSync.erase(it);
