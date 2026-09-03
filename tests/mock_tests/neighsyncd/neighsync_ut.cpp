@@ -3,9 +3,12 @@
 #include <arpa/inet.h>
 #include <cstring>
 #include <linux/neighbour.h>
+#include <memory>
 #include <net/if.h>
 #include <netlink/addr.h>
 #include <netlink/route/neighbour.h>
+#include <string>
+#include <vector>
 
 #include "../mock_table.h"
 #include "neighsyncd/neighsync.h"
