@@ -6,6 +6,7 @@
 #include <memory>
 #include <net/if.h>
 #include <netlink/addr.h>
+#include <netlink/msg.h>
 #include <netlink/route/neighbour.h>
 #include <string>
 #include <vector>
@@ -29,43 +30,67 @@ struct RtnlNeighDeleter
 
 using RtnlNeighPtr = std::unique_ptr<struct rtnl_neigh, RtnlNeighDeleter>;
 
+struct NlMsgDeleter
+{
+    void operator()(struct nl_msg *msg) const
+    {
+        nlmsg_free(msg);
+    }
+};
+
+using NlMsgPtr = std::unique_ptr<struct nl_msg, NlMsgDeleter>;
+
 RtnlNeighPtr createNeighbor(int family, const std::string& ip, int state)
 {
-    char buffer[512] = {};
-    struct nlmsghdr *hdr = reinterpret_cast<struct nlmsghdr *>(buffer);
-    hdr->nlmsg_type = RTM_NEWNEIGH;
-    hdr->nlmsg_flags = NLM_F_REQUEST;
-    hdr->nlmsg_len = NLMSG_LENGTH(sizeof(struct ndmsg));
+    NlMsgPtr msg(nlmsg_alloc());
+    if (!msg)
+    {
+        return nullptr;
+    }
+
+    struct nlmsghdr *hdr = nlmsg_put(
+        msg.get(), NL_AUTO_PORT, NL_AUTO_SEQ, RTM_NEWNEIGH, sizeof(struct ndmsg), NLM_F_REQUEST);
+    if (!hdr)
+    {
+        return nullptr;
+    }
 
     struct ndmsg *nd = static_cast<struct ndmsg *>(NLMSG_DATA(hdr));
+    memset(nd, 0, sizeof(*nd));
     nd->ndm_family = static_cast<unsigned char>(family);
     nd->ndm_ifindex = static_cast<int>(if_nametoindex("lo"));
     nd->ndm_state = static_cast<unsigned short>(state);
     nd->ndm_type = RTN_UNICAST;
 
-    struct rtattr *dst = reinterpret_cast<struct rtattr *>(
-        buffer + NLMSG_ALIGN(hdr->nlmsg_len));
     size_t addressLength = family == AF_INET ? sizeof(struct in_addr) : sizeof(struct in6_addr);
+    struct rtattr *dst = static_cast<struct rtattr *>(
+        nlmsg_reserve(msg.get(), RTA_LENGTH(addressLength), NLMSG_ALIGNTO));
+    if (!dst)
+    {
+        return nullptr;
+    }
+
     dst->rta_type = NDA_DST;
     dst->rta_len = static_cast<unsigned short>(RTA_LENGTH(addressLength));
     if (inet_pton(family, ip.c_str(), RTA_DATA(dst)) != 1)
     {
         return nullptr;
     }
-    hdr->nlmsg_len = static_cast<unsigned int>(
-        NLMSG_ALIGN(hdr->nlmsg_len) + RTA_ALIGN(dst->rta_len));
 
     const unsigned char mac[] = {0x00, 0x11, 0x22, 0x33, 0x44, 0x55};
-    struct rtattr *lladdr = reinterpret_cast<struct rtattr *>(
-        buffer + NLMSG_ALIGN(hdr->nlmsg_len));
+    struct rtattr *lladdr = static_cast<struct rtattr *>(
+        nlmsg_reserve(msg.get(), RTA_LENGTH(sizeof(mac)), NLMSG_ALIGNTO));
+    if (!lladdr)
+    {
+        return nullptr;
+    }
+
     lladdr->rta_type = NDA_LLADDR;
     lladdr->rta_len = static_cast<unsigned short>(RTA_LENGTH(sizeof(mac)));
     memcpy(RTA_DATA(lladdr), mac, sizeof(mac));
-    hdr->nlmsg_len = static_cast<unsigned int>(
-        NLMSG_ALIGN(hdr->nlmsg_len) + RTA_ALIGN(lladdr->rta_len));
 
     struct rtnl_neigh *neigh = nullptr;
-    if (rtnl_neigh_parse(hdr, &neigh) < 0)
+    if (rtnl_neigh_parse(nlmsg_hdr(msg.get()), &neigh) < 0)
     {
         return nullptr;
     }
