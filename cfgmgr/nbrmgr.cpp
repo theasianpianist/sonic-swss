@@ -19,7 +19,7 @@ using namespace swss;
 static constexpr const char *NDISC6_CMD = "/usr/bin/ndisc6";
 static constexpr int NDISC6_NO_RESPONSE = 2;
 
-static bool send_message_internal(struct nl_sock *sk, struct nl_msg *msg, bool waitForAck)
+static bool send_message(struct nl_sock *sk, struct nl_msg *msg, bool waitForAck = false)
 {
     bool rc = false;
     int err = 0;
@@ -58,16 +58,6 @@ static bool send_message_internal(struct nl_sock *sk, struct nl_msg *msg, bool w
 
     nlmsg_free(msg);
     return rc;
-}
-
-static bool send_message(struct nl_sock *sk, struct nl_msg *msg)
-{
-    return send_message_internal(sk, msg, false);
-}
-
-static bool send_message_with_ack(struct nl_sock *sk, struct nl_msg *msg)
-{
-    return send_message_internal(sk, msg, true);
 }
 
 NbrMgr::NbrMgr(DBConnector *cfgDb, DBConnector *appDb, DBConnector *stateDb, const vector<string> &tableNames) :
@@ -305,7 +295,7 @@ bool NbrMgr::setFailedNeighborIncomplete(const string& alias, const IpAddress& i
     nd_msg->ndm_type = RTN_UNICAST;
     nd_msg->ndm_state = NUD_INCOMPLETE;
 
-    return send_message_with_ack(m_nl_sock, msg);
+    return send_message(m_nl_sock, msg, true);
 }
 
 bool NbrMgr::sendNeighborSolicitation(const string& alias, const IpAddress& ip)
