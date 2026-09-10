@@ -1,9 +1,12 @@
 #include "gtest/gtest.h"
+#include <cstddef>
 #include <iostream>
 #include <netlink/netlink.h>
 #include <netlink/msg.h>
 #include <linux/neighbour.h>
 #include <net/if.h>
+#include <sys/socket.h>
+#include <sys/time.h>
 #include "../mock_table.h"
 #include "warm_restart.h"
 #include "nbrmgr.h"
@@ -25,6 +28,18 @@ static int mockNlSendResult;
 static int mockNlAckResult;
 static int mockExecResult;
 static bool mockAutoAckDisabled;
+static int mockNlSocketAllocCount;
+static int mockNlSocketFreeCount;
+static int mockNlConnectCount;
+static bool mockAckTimeoutConfigured;
+static struct timeval mockAckTimeout;
+static struct nl_sock *mockPersistentSocket;
+static std::vector<struct nl_sock *> mockAckSockets;
+static std::vector<struct nl_sock *> mockSendSockets;
+static std::vector<struct nl_sock *> mockAckWaitSockets;
+static struct nl_sock *mockAutoAckDisabledSocket;
+static const struct nl_sock *mockTimeoutSocket;
+static std::vector<struct nl_sock *> mockFreedSockets;
 
 /*
  * Wrap netlink and interface functions to avoid real kernel interaction.
@@ -36,13 +51,30 @@ extern "C" {
 
 struct nl_sock *__wrap_nl_socket_alloc(void)
 {
-    /* Return a non-null fake pointer; nl_sock is opaque so cast from raw memory */
-    static char fake_sock_mem[256];
-    return reinterpret_cast<struct nl_sock *>(fake_sock_mem);
+    static std::max_align_t fakeSockets[8];
+    struct nl_sock *sock = reinterpret_cast<struct nl_sock *>(
+        &fakeSockets[mockNlSocketAllocCount]);
+    if (mockNlSocketAllocCount == 0)
+    {
+        mockPersistentSocket = sock;
+    }
+    else
+    {
+        mockAckSockets.push_back(sock);
+    }
+    mockNlSocketAllocCount++;
+    return sock;
+}
+
+void __wrap_nl_socket_free(struct nl_sock *sk)
+{
+    mockNlSocketFreeCount++;
+    mockFreedSockets.push_back(sk);
 }
 
 int __wrap_nl_connect(struct nl_sock *sk, int protocol)
 {
+    mockNlConnectCount++;
     return 0;
 }
 
@@ -52,12 +84,14 @@ int __wrap_nl_send_auto(struct nl_sock *sk, struct nl_msg *msg)
     struct ndmsg *nd = static_cast<struct ndmsg *>(NLMSG_DATA(hdr));
     capturedNeighborRequests.push_back(
         {nd->ndm_state, nd->ndm_flags, nd->ndm_family, hdr->nlmsg_flags});
+    mockSendSockets.push_back(sk);
     operationOrder.push_back("netlink");
     return mockNlSendResult;
 }
 
 int __wrap_nl_wait_for_ack(struct nl_sock *sk)
 {
+    mockAckWaitSockets.push_back(sk);
     operationOrder.push_back("ack");
     return mockNlAckResult;
 }
@@ -65,6 +99,25 @@ int __wrap_nl_wait_for_ack(struct nl_sock *sk)
 void __wrap_nl_socket_disable_auto_ack(struct nl_sock *sk)
 {
     mockAutoAckDisabled = true;
+    mockAutoAckDisabledSocket = sk;
+}
+
+int __wrap_nl_socket_get_fd(const struct nl_sock *sk)
+{
+    mockTimeoutSocket = sk;
+    return 42;
+}
+
+int __wrap_setsockopt(int socket, int level, int optionName,
+                      const void *optionValue, socklen_t optionLength)
+{
+    if (level == SOL_SOCKET && optionName == SO_RCVTIMEO &&
+        optionLength == sizeof(struct timeval))
+    {
+        mockAckTimeout = *static_cast<const struct timeval *>(optionValue);
+        mockAckTimeoutConfigured = true;
+    }
+    return 0;
 }
 
 /* Control whether nlmsg_alloc returns NULL to simulate setNeighbor failure */
@@ -127,6 +180,18 @@ namespace nbrmgr_ut
             mockNlAckResult = 0;
             mockExecResult = 0;
             mockAutoAckDisabled = false;
+            mockNlSocketAllocCount = 0;
+            mockNlSocketFreeCount = 0;
+            mockNlConnectCount = 0;
+            mockAckTimeoutConfigured = false;
+            memset(&mockAckTimeout, 0, sizeof(mockAckTimeout));
+            mockPersistentSocket = nullptr;
+            mockAckSockets.clear();
+            mockSendSockets.clear();
+            mockAckWaitSockets.clear();
+            mockAutoAckDisabledSocket = nullptr;
+            mockTimeoutSocket = nullptr;
+            mockFreedSockets.clear();
             callback = noop_cb;
         }
 
@@ -267,6 +332,22 @@ namespace nbrmgr_ut
         processFailedNeighborRequest(nbrmgr, "Vlan1000:2001:db8::1");
 
         EXPECT_TRUE(mockAutoAckDisabled);
+        EXPECT_EQ(mockNlSocketAllocCount, 2);
+        EXPECT_EQ(mockNlSocketFreeCount, 1);
+        EXPECT_EQ(mockNlConnectCount, 2);
+        EXPECT_TRUE(mockAckTimeoutConfigured);
+        EXPECT_EQ(mockAckTimeout.tv_sec, 1);
+        EXPECT_EQ(mockAckTimeout.tv_usec, 0);
+        ASSERT_EQ(mockAckSockets.size(), 1u);
+        ASSERT_EQ(mockSendSockets.size(), 1u);
+        ASSERT_EQ(mockAckWaitSockets.size(), 1u);
+        ASSERT_EQ(mockFreedSockets.size(), 1u);
+        EXPECT_NE(mockAckSockets[0], mockPersistentSocket);
+        EXPECT_EQ(mockAutoAckDisabledSocket, mockPersistentSocket);
+        EXPECT_EQ(mockSendSockets[0], mockAckSockets[0]);
+        EXPECT_EQ(mockAckWaitSockets[0], mockAckSockets[0]);
+        EXPECT_EQ(mockTimeoutSocket, mockAckSockets[0]);
+        EXPECT_EQ(mockFreedSockets[0], mockAckSockets[0]);
         ASSERT_EQ(capturedNeighborRequests.size(), 1u);
         EXPECT_EQ(capturedNeighborRequests[0].state, NUD_INCOMPLETE);
         EXPECT_EQ(capturedNeighborRequests[0].neighborFlags, 0u);
@@ -301,16 +382,18 @@ namespace nbrmgr_ut
         EXPECT_FALSE(hasPendingFailedNeighborTask(nbrmgr));
     }
 
-    TEST_F(NbrMgrTest, NetlinkAckFailureRetries)
+    TEST_F(NbrMgrTest, NetlinkAckTimeoutRetries)
     {
         std::vector<std::string> cfg_nbr_tables = {CFG_NEIGH_TABLE_NAME};
         TestableNbrMgr nbrmgr(m_config_db.get(), m_app_db.get(), m_state_db.get(), cfg_nbr_tables);
-        mockNlAckResult = -NLE_FAILURE;
+        mockNlAckResult = -NLE_AGAIN;
         processFailedNeighborRequest(nbrmgr, "Vlan1000:2001:db8::3");
 
         EXPECT_EQ(operationOrder, (std::vector<std::string>{"netlink", "ack"}));
         EXPECT_TRUE(mockCallArgs.empty());
         EXPECT_TRUE(hasPendingFailedNeighborTask(nbrmgr));
+        EXPECT_EQ(mockNlSocketAllocCount, 2);
+        EXPECT_EQ(mockNlSocketFreeCount, 1);
 
         mockNlAckResult = 0;
         nbrmgr.doTask();
@@ -318,6 +401,8 @@ namespace nbrmgr_ut
         EXPECT_EQ(operationOrder,
                   (std::vector<std::string>{"netlink", "ack", "netlink", "ack", "ndisc6"}));
         EXPECT_FALSE(hasPendingFailedNeighborTask(nbrmgr));
+        EXPECT_EQ(mockNlSocketAllocCount, 3);
+        EXPECT_EQ(mockNlSocketFreeCount, 2);
     }
 
     TEST_F(NbrMgrTest, NoSolicitationResponseIsSuccess)
