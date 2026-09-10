@@ -1,6 +1,8 @@
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <net/if.h>
+#include <sys/socket.h>
+#include <sys/time.h>
 #include <unistd.h>
 #include <linux/neighbour.h>
 #include <netlink/msg.h>
@@ -18,21 +20,52 @@ using namespace swss;
 
 static constexpr const char *NDISC6_CMD = "/usr/bin/ndisc6";
 static constexpr int NDISC6_NO_RESPONSE = 2;
+static constexpr time_t NETLINK_ACK_TIMEOUT_SEC = 1;
 
 static bool send_message(struct nl_sock *sk, struct nl_msg *msg, bool waitForAck = false)
 {
     bool rc = false;
     int err = 0;
+    struct nl_sock *ackSock = nullptr;
+    struct nl_sock *sendSock = sk;
 
     do
     {
-        if (!sk)
+        if (waitForAck)
+        {
+            ackSock = nl_socket_alloc();
+            if (!ackSock)
+            {
+                SWSS_LOG_ERROR("Netlink ACK socket alloc failed");
+                break;
+            }
+
+            if ((err = nl_connect(ackSock, NETLINK_ROUTE)) < 0)
+            {
+                SWSS_LOG_ERROR("Netlink ACK socket connect failed, error '%s'", nl_geterror(err));
+                break;
+            }
+
+            struct timeval timeout = {};
+            timeout.tv_sec = NETLINK_ACK_TIMEOUT_SEC;
+            if (setsockopt(nl_socket_get_fd(ackSock), SOL_SOCKET, SO_RCVTIMEO,
+                           &timeout, sizeof(timeout)) < 0)
+            {
+                SWSS_LOG_ERROR("Netlink ACK socket timeout configuration failed: %s",
+                               strerror(errno));
+                break;
+            }
+
+            sendSock = ackSock;
+        }
+
+        if (!sendSock)
         {
             SWSS_LOG_ERROR("Netlink socket null pointer");
             break;
         }
 
-        if ((err = nl_send_auto(sk, msg)) < 0)
+        if ((err = nl_send_auto(sendSock, msg)) < 0)
         {
             SWSS_LOG_ERROR("Netlink send message failed, error '%s'", nl_geterror(err));
             break;
@@ -42,7 +75,7 @@ static bool send_message(struct nl_sock *sk, struct nl_msg *msg, bool waitForAck
         {
             do
             {
-                err = nl_wait_for_ack(sk);
+                err = nl_wait_for_ack(sendSock);
             }
             while (err == -NLE_INTR);
 
@@ -57,6 +90,10 @@ static bool send_message(struct nl_sock *sk, struct nl_msg *msg, bool waitForAck
     } while(0);
 
     nlmsg_free(msg);
+    if (ackSock)
+    {
+        nl_socket_free(ackSock);
+    }
     return rc;
 }
 
