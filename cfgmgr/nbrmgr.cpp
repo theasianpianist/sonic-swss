@@ -385,8 +385,9 @@ task_process_status NbrMgr::processKernelFailedNeighbor(const string& key, const
 
         if (!sendNeighborSolicitation(alias, ip))
         {
-            SWSS_LOG_WARN("Moved kernel neighbor '%s' to INCOMPLETE but failed to execute ndisc6", key.c_str());
-            return task_failed;
+            SWSS_LOG_WARN("Moved kernel neighbor '%s' to INCOMPLETE but failed to execute ndisc6, retrying",
+                          key.c_str());
+            return task_need_retry;
         }
 
         SWSS_LOG_NOTICE("Moved kernel neighbor '%s' to INCOMPLETE and sent one NS", key.c_str());
