@@ -17,8 +17,9 @@
 using namespace swss;
 
 static constexpr const char *NDISC6_CMD = "/usr/bin/ndisc6";
+static constexpr int NDISC6_NO_RESPONSE = 2;
 
-static bool send_message(struct nl_sock *sk, struct nl_msg *msg)
+static bool send_message_internal(struct nl_sock *sk, struct nl_msg *msg, bool waitForAck)
 {
     bool rc = false;
     int err = 0;
@@ -37,11 +38,36 @@ static bool send_message(struct nl_sock *sk, struct nl_msg *msg)
             break;
         }
 
+        if (waitForAck)
+        {
+            do
+            {
+                err = nl_wait_for_ack(sk);
+            }
+            while (err == -NLE_INTR);
+
+            if (err < 0)
+            {
+                SWSS_LOG_ERROR("Netlink ACK failed, error '%s'", nl_geterror(err));
+                break;
+            }
+        }
+
         rc = true;
     } while(0);
 
     nlmsg_free(msg);
     return rc;
+}
+
+static bool send_message(struct nl_sock *sk, struct nl_msg *msg)
+{
+    return send_message_internal(sk, msg, false);
+}
+
+static bool send_message_with_ack(struct nl_sock *sk, struct nl_msg *msg)
+{
+    return send_message_internal(sk, msg, true);
 }
 
 NbrMgr::NbrMgr(DBConnector *cfgDb, DBConnector *appDb, DBConnector *stateDb, const vector<string> &tableNames) :
@@ -62,6 +88,10 @@ NbrMgr::NbrMgr(DBConnector *cfgDb, DBConnector *appDb, DBConnector *stateDb, con
     else if ((err = nl_connect(m_nl_sock, NETLINK_ROUTE)) < 0)
     {
         SWSS_LOG_ERROR("Netlink socket connect failed, error '%s'", nl_geterror(err));
+    }
+    else
+    {
+        nl_socket_disable_auto_ack(m_nl_sock);
     }
 
     auto consumerStateTable = new swss::ConsumerStateTable(appDb, APP_NEIGH_RESOLVE_TABLE_NAME,
@@ -130,7 +160,7 @@ bool NbrMgr::setNeighbor(const string& alias, const IpAddress& ip, const MacAddr
         return false;
     }
 
-    auto flags = (NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE | NLM_F_REPLACE);
+    auto flags = (NLM_F_REQUEST | NLM_F_CREATE | NLM_F_REPLACE);
 
     struct nlmsghdr *hdr = nlmsg_put(msg, NL_AUTO_PORT, NL_AUTO_SEQ, RTM_NEWNEIGH, 0, flags);
     if (!hdr)
@@ -275,60 +305,70 @@ bool NbrMgr::setFailedNeighborIncomplete(const string& alias, const IpAddress& i
     nd_msg->ndm_type = RTN_UNICAST;
     nd_msg->ndm_state = NUD_INCOMPLETE;
 
-    return send_message(m_nl_sock, msg);
+    return send_message_with_ack(m_nl_sock, msg);
 }
 
 bool NbrMgr::sendNeighborSolicitation(const string& alias, const IpAddress& ip)
 {
-    string command = string(NDISC6_CMD) + " -q -w 0 -1 " +
+    string command = string(NDISC6_CMD) + " -q -r 1 -w 0 " +
                      shellquote(ip.to_string()) + " " + shellquote(alias);
     string output;
     int32_t result = swss::exec(command, output);
-    if (result != 0)
+    if (result == 0 || result == NDISC6_NO_RESPONSE)
     {
-        SWSS_LOG_WARN("Failed to send neighbor solicitation for '%s' on '%s', error: %d, output: %s",
-                      ip.to_string().c_str(), alias.c_str(), result, output.c_str());
-        return false;
+        return true;
     }
 
-    return true;
+    SWSS_LOG_WARN("Failed to execute neighbor solicitation for '%s' on '%s', error: %d, output: %s",
+                  ip.to_string().c_str(), alias.c_str(), result, output.c_str());
+    return false;
 }
 
-void NbrMgr::processKernelFailedNeighbor(const string& key, const string& tableSeparator)
+task_process_status NbrMgr::processKernelFailedNeighbor(const string& key, const string& tableSeparator)
 {
     try
     {
         if (key.find(tableSeparator) == string::npos)
         {
             SWSS_LOG_ERROR("Invalid failed kernel neighbor entry '%s'", key.c_str());
+            return task_invalid_entry;
         }
-        else
-        {
-            vector<string> parsedKeys = parseAliasIp(key, tableSeparator.c_str());
-            string alias(parsedKeys[0]);
-            IpAddress ip(parsedKeys[1]);
 
-            if (ip.isV4())
-            {
-                SWSS_LOG_ERROR("Ignoring non-IPv6 failed kernel neighbor '%s'", key.c_str());
-            }
-            else if (!setFailedNeighborIncomplete(alias, ip))
-            {
-                SWSS_LOG_ERROR("Failed to move kernel neighbor '%s' to INCOMPLETE", key.c_str());
-            }
-            else if (sendNeighborSolicitation(alias, ip))
-            {
-                SWSS_LOG_NOTICE("Moved kernel neighbor '%s' to INCOMPLETE and sent one NS", key.c_str());
-            }
-            else
-            {
-                SWSS_LOG_WARN("Moved kernel neighbor '%s' to INCOMPLETE but failed to send NS", key.c_str());
-            }
+        vector<string> parsedKeys = parseAliasIp(key, tableSeparator.c_str());
+        string alias(parsedKeys[0]);
+        IpAddress ip(parsedKeys[1]);
+
+        if (alias.empty())
+        {
+            SWSS_LOG_ERROR("Invalid empty interface in failed kernel neighbor entry '%s'", key.c_str());
+            return task_invalid_entry;
         }
+
+        if (ip.isV4())
+        {
+            SWSS_LOG_ERROR("Ignoring non-IPv6 failed kernel neighbor '%s'", key.c_str());
+            return task_invalid_entry;
+        }
+
+        if (!setFailedNeighborIncomplete(alias, ip))
+        {
+            SWSS_LOG_ERROR("Failed to move kernel neighbor '%s' to INCOMPLETE, retrying", key.c_str());
+            return task_need_retry;
+        }
+
+        if (!sendNeighborSolicitation(alias, ip))
+        {
+            SWSS_LOG_WARN("Moved kernel neighbor '%s' to INCOMPLETE but failed to execute ndisc6", key.c_str());
+            return task_failed;
+        }
+
+        SWSS_LOG_NOTICE("Moved kernel neighbor '%s' to INCOMPLETE and sent one NS", key.c_str());
+        return task_success;
     }
     catch (const std::invalid_argument& e)
     {
         SWSS_LOG_ERROR("Failed to process kernel neighbor '%s': %s", key.c_str(), e.what());
+        return task_invalid_entry;
     }
 }
 
@@ -443,7 +483,12 @@ void NbrMgr::doKernelFailedNeighTask(Consumer& consumer)
         KeyOpFieldsValuesTuple t = it->second;
         if (kfvOp(t) == SET_COMMAND)
         {
-            processKernelFailedNeighbor(kfvKey(t), tableSeparator);
+            task_process_status status = processKernelFailedNeighbor(kfvKey(t), tableSeparator);
+            if (status == task_need_retry)
+            {
+                it++;
+                continue;
+            }
         }
 
         it = consumer.m_toSync.erase(it);

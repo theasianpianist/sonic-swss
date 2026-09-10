@@ -28,7 +28,7 @@ private:
     bool setNeighbor(const std::string& alias, const IpAddress& ip, const MacAddress& mac);
     bool setFailedNeighborIncomplete(const std::string& alias, const IpAddress& ip);
     bool sendNeighborSolicitation(const std::string& alias, const IpAddress& ip);
-    void processKernelFailedNeighbor(const std::string& key, const std::string& tableSeparator);
+    task_process_status processKernelFailedNeighbor(const std::string& key, const std::string& tableSeparator);
 
     vector<string> parseAliasIp(const string &app_db_nbr_tbl_key, const char *delimiter);
 
