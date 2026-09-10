@@ -417,7 +417,7 @@ namespace nbrmgr_ut
         EXPECT_FALSE(hasPendingFailedNeighborTask(nbrmgr));
     }
 
-    TEST_F(NbrMgrTest, SolicitationExecutionFailureIsTerminal)
+    TEST_F(NbrMgrTest, SolicitationExecutionFailureRetries)
     {
         std::vector<std::string> cfg_nbr_tables = {CFG_NEIGH_TABLE_NAME};
         TestableNbrMgr nbrmgr(m_config_db.get(), m_app_db.get(), m_state_db.get(), cfg_nbr_tables);
@@ -426,6 +426,18 @@ namespace nbrmgr_ut
 
         EXPECT_EQ(capturedNeighborRequests.size(), 1u);
         EXPECT_EQ(mockCallArgs.size(), 1u);
+        EXPECT_TRUE(hasPendingFailedNeighborTask(nbrmgr));
+
+        mockExecResult = 0;
+        nbrmgr.doTask();
+
+        EXPECT_EQ(capturedNeighborRequests.size(), 2u);
+        EXPECT_EQ(mockCallArgs.size(), 2u);
+        EXPECT_EQ(operationOrder,
+                  (std::vector<std::string>{
+                      "netlink", "ack", "ndisc6",
+                      "netlink", "ack", "ndisc6",
+                  }));
         EXPECT_FALSE(hasPendingFailedNeighborTask(nbrmgr));
     }
 
