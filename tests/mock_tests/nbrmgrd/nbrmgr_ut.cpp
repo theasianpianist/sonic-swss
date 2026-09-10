@@ -22,7 +22,9 @@ struct CapturedNeighborRequest
 static std::vector<CapturedNeighborRequest> capturedNeighborRequests;
 static std::vector<std::string> operationOrder;
 static int mockNlSendResult;
+static int mockNlAckResult;
 static int mockExecResult;
+static bool mockAutoAckDisabled;
 
 /*
  * Wrap netlink and interface functions to avoid real kernel interaction.
@@ -52,6 +54,17 @@ int __wrap_nl_send_auto(struct nl_sock *sk, struct nl_msg *msg)
         {nd->ndm_state, nd->ndm_flags, nd->ndm_family, hdr->nlmsg_flags});
     operationOrder.push_back("netlink");
     return mockNlSendResult;
+}
+
+int __wrap_nl_wait_for_ack(struct nl_sock *sk)
+{
+    operationOrder.push_back("ack");
+    return mockNlAckResult;
+}
+
+void __wrap_nl_socket_disable_auto_ack(struct nl_sock *sk)
+{
+    mockAutoAckDisabled = true;
 }
 
 /* Control whether nlmsg_alloc returns NULL to simulate setNeighbor failure */
@@ -111,7 +124,9 @@ namespace nbrmgr_ut
             operationOrder.clear();
             mock_nlmsg_alloc_fail = false;
             mockNlSendResult = 0;
+            mockNlAckResult = 0;
             mockExecResult = 0;
+            mockAutoAckDisabled = false;
             callback = noop_cb;
         }
 
@@ -125,6 +140,13 @@ namespace nbrmgr_ut
             auto executor = nbrmgr.getExecutor(APP_NEIGH_FAILED_TABLE_NAME);
             ASSERT_NE(executor, nullptr);
             executor->execute();
+        }
+
+        bool hasPendingFailedNeighborTask(TestableNbrMgr& nbrmgr)
+        {
+            auto consumer = dynamic_cast<Consumer *>(nbrmgr.getExecutor(APP_NEIGH_FAILED_TABLE_NAME));
+            EXPECT_NE(consumer, nullptr);
+            return consumer && !consumer->m_toSync.empty();
         }
     };
 
@@ -244,6 +266,7 @@ namespace nbrmgr_ut
         TestableNbrMgr nbrmgr(m_config_db.get(), m_app_db.get(), m_state_db.get(), cfg_nbr_tables);
         processFailedNeighborRequest(nbrmgr, "Vlan1000:2001:db8::1");
 
+        EXPECT_TRUE(mockAutoAckDisabled);
         ASSERT_EQ(capturedNeighborRequests.size(), 1u);
         EXPECT_EQ(capturedNeighborRequests[0].state, NUD_INCOMPLETE);
         EXPECT_EQ(capturedNeighborRequests[0].neighborFlags, 0u);
@@ -253,11 +276,12 @@ namespace nbrmgr_ut
         EXPECT_NE(capturedNeighborRequests[0].messageFlags & NLM_F_ACK, 0);
 
         ASSERT_EQ(mockCallArgs.size(), 1u);
-        EXPECT_EQ(mockCallArgs[0], "/usr/bin/ndisc6 -q -w 0 -1 \"2001:db8::1\" \"Vlan1000\"");
-        EXPECT_EQ(operationOrder, (std::vector<std::string>{"netlink", "ndisc6"}));
+        EXPECT_EQ(mockCallArgs[0], "/usr/bin/ndisc6 -q -r 1 -w 0 \"2001:db8::1\" \"Vlan1000\"");
+        EXPECT_EQ(operationOrder, (std::vector<std::string>{"netlink", "ack", "ndisc6"}));
+        EXPECT_FALSE(hasPendingFailedNeighborTask(nbrmgr));
     }
 
-    TEST_F(NbrMgrTest, NetlinkFailureSkipsSolicitation)
+    TEST_F(NbrMgrTest, NetlinkSendFailureRetries)
     {
         std::vector<std::string> cfg_nbr_tables = {CFG_NEIGH_TABLE_NAME};
         TestableNbrMgr nbrmgr(m_config_db.get(), m_app_db.get(), m_state_db.get(), cfg_nbr_tables);
@@ -267,17 +291,57 @@ namespace nbrmgr_ut
         ASSERT_EQ(capturedNeighborRequests.size(), 1u);
         EXPECT_TRUE(mockCallArgs.empty());
         EXPECT_EQ(operationOrder, (std::vector<std::string>{"netlink"}));
+        EXPECT_TRUE(hasPendingFailedNeighborTask(nbrmgr));
+
+        mockNlSendResult = 0;
+        nbrmgr.doTask();
+
+        EXPECT_EQ(operationOrder,
+                  (std::vector<std::string>{"netlink", "netlink", "ack", "ndisc6"}));
+        EXPECT_FALSE(hasPendingFailedNeighborTask(nbrmgr));
     }
 
-    TEST_F(NbrMgrTest, SolicitationFailureAfterNetlinkUpdate)
+    TEST_F(NbrMgrTest, NetlinkAckFailureRetries)
+    {
+        std::vector<std::string> cfg_nbr_tables = {CFG_NEIGH_TABLE_NAME};
+        TestableNbrMgr nbrmgr(m_config_db.get(), m_app_db.get(), m_state_db.get(), cfg_nbr_tables);
+        mockNlAckResult = -NLE_FAILURE;
+        processFailedNeighborRequest(nbrmgr, "Vlan1000:2001:db8::3");
+
+        EXPECT_EQ(operationOrder, (std::vector<std::string>{"netlink", "ack"}));
+        EXPECT_TRUE(mockCallArgs.empty());
+        EXPECT_TRUE(hasPendingFailedNeighborTask(nbrmgr));
+
+        mockNlAckResult = 0;
+        nbrmgr.doTask();
+
+        EXPECT_EQ(operationOrder,
+                  (std::vector<std::string>{"netlink", "ack", "netlink", "ack", "ndisc6"}));
+        EXPECT_FALSE(hasPendingFailedNeighborTask(nbrmgr));
+    }
+
+    TEST_F(NbrMgrTest, NoSolicitationResponseIsSuccess)
+    {
+        std::vector<std::string> cfg_nbr_tables = {CFG_NEIGH_TABLE_NAME};
+        TestableNbrMgr nbrmgr(m_config_db.get(), m_app_db.get(), m_state_db.get(), cfg_nbr_tables);
+        mockExecResult = 2;
+        processFailedNeighborRequest(nbrmgr, "Vlan1000:2001:db8::4");
+
+        EXPECT_EQ(capturedNeighborRequests.size(), 1u);
+        EXPECT_EQ(mockCallArgs.size(), 1u);
+        EXPECT_FALSE(hasPendingFailedNeighborTask(nbrmgr));
+    }
+
+    TEST_F(NbrMgrTest, SolicitationExecutionFailureIsTerminal)
     {
         std::vector<std::string> cfg_nbr_tables = {CFG_NEIGH_TABLE_NAME};
         TestableNbrMgr nbrmgr(m_config_db.get(), m_app_db.get(), m_state_db.get(), cfg_nbr_tables);
         mockExecResult = 1;
-        processFailedNeighborRequest(nbrmgr, "Vlan1000:2001:db8::3");
+        processFailedNeighborRequest(nbrmgr, "Vlan1000:2001:db8::5");
 
         EXPECT_EQ(capturedNeighborRequests.size(), 1u);
         EXPECT_EQ(mockCallArgs.size(), 1u);
+        EXPECT_FALSE(hasPendingFailedNeighborTask(nbrmgr));
     }
 
     TEST_F(NbrMgrTest, RejectsIpv4FailedNeighborRequest)
@@ -298,5 +362,16 @@ namespace nbrmgr_ut
 
         EXPECT_TRUE(capturedNeighborRequests.empty());
         EXPECT_TRUE(mockCallArgs.empty());
+    }
+
+    TEST_F(NbrMgrTest, RejectsEmptyInterfaceFailedNeighborRequest)
+    {
+        std::vector<std::string> cfg_nbr_tables = {CFG_NEIGH_TABLE_NAME};
+        TestableNbrMgr nbrmgr(m_config_db.get(), m_app_db.get(), m_state_db.get(), cfg_nbr_tables);
+        processFailedNeighborRequest(nbrmgr, ":2001:db8::6");
+
+        EXPECT_TRUE(capturedNeighborRequests.empty());
+        EXPECT_TRUE(mockCallArgs.empty());
+        EXPECT_FALSE(hasPendingFailedNeighborTask(nbrmgr));
     }
 }
