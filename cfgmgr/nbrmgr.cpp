@@ -126,11 +126,17 @@ NbrMgr::NbrMgr(DBConnector *cfgDb, DBConnector *appDb, DBConnector *stateDb, con
     auto consumer = new Consumer(consumerStateTable, this, APP_NEIGH_RESOLVE_TABLE_NAME);
     Orch::addExecutor(consumer);
 
-    auto failedNeighConsumerStateTable = new swss::ConsumerStateTable(
-        appDb, APP_NEIGH_FAILED_TABLE_NAME, TableConsumable::DEFAULT_POP_BATCH_SIZE, default_orch_pri);
-    auto failedNeighConsumer = new Consumer(
-        failedNeighConsumerStateTable, this, APP_NEIGH_FAILED_TABLE_NAME);
-    Orch::addExecutor(failedNeighConsumer);
+    Table cfgPeerSwitchTable(cfgDb, CFG_PEER_SWITCH_TABLE_NAME);
+    vector<string> peerSwitchKeys;
+    cfgPeerSwitchTable.getKeys(peerSwitchKeys);
+    if (!peerSwitchKeys.empty())
+    {
+        auto failedNeighConsumerStateTable = new swss::ConsumerStateTable(
+            appDb, APP_NEIGH_FAILED_TABLE_NAME, TableConsumable::DEFAULT_POP_BATCH_SIZE, default_orch_pri);
+        auto failedNeighConsumer = new Consumer(
+            failedNeighConsumerStateTable, this, APP_NEIGH_FAILED_TABLE_NAME);
+        Orch::addExecutor(failedNeighConsumer);
+    }
 
     /* Reconcile any pending entries in NEIGH_RESOLVE_TABLE from before restart */
     reconcileNeighResolveTable(appDb);
