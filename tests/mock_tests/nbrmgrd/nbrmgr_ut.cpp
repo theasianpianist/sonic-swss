@@ -207,6 +207,12 @@ namespace nbrmgr_ut
             executor->execute();
         }
 
+        void enableDualTor()
+        {
+            swss::Table peerSwitchTable(m_config_db.get(), CFG_PEER_SWITCH_TABLE_NAME);
+            peerSwitchTable.set("peer_switch_hostname", {{"address_ipv4", "10.0.0.1"}});
+        }
+
         bool hasPendingFailedNeighborTask(TestableNbrMgr& nbrmgr)
         {
             auto consumer = dynamic_cast<Consumer *>(nbrmgr.getExecutor(APP_NEIGH_FAILED_TABLE_NAME));
@@ -328,6 +334,7 @@ namespace nbrmgr_ut
     TEST_F(NbrMgrTest, ProcessFailedIpv6Neighbor)
     {
         std::vector<std::string> cfg_nbr_tables = {CFG_NEIGH_TABLE_NAME};
+        enableDualTor();
         TestableNbrMgr nbrmgr(m_config_db.get(), m_app_db.get(), m_state_db.get(), cfg_nbr_tables);
         processFailedNeighborRequest(nbrmgr, "Vlan1000:2001:db8::1");
 
@@ -365,6 +372,7 @@ namespace nbrmgr_ut
     TEST_F(NbrMgrTest, NetlinkSendFailureRetries)
     {
         std::vector<std::string> cfg_nbr_tables = {CFG_NEIGH_TABLE_NAME};
+        enableDualTor();
         TestableNbrMgr nbrmgr(m_config_db.get(), m_app_db.get(), m_state_db.get(), cfg_nbr_tables);
         mockNlSendResult = -NLE_FAILURE;
         processFailedNeighborRequest(nbrmgr, "Vlan1000:2001:db8::2");
@@ -385,6 +393,7 @@ namespace nbrmgr_ut
     TEST_F(NbrMgrTest, NetlinkAckTimeoutRetries)
     {
         std::vector<std::string> cfg_nbr_tables = {CFG_NEIGH_TABLE_NAME};
+        enableDualTor();
         TestableNbrMgr nbrmgr(m_config_db.get(), m_app_db.get(), m_state_db.get(), cfg_nbr_tables);
         mockNlAckResult = -NLE_AGAIN;
         processFailedNeighborRequest(nbrmgr, "Vlan1000:2001:db8::3");
@@ -408,6 +417,7 @@ namespace nbrmgr_ut
     TEST_F(NbrMgrTest, NoSolicitationResponseIsSuccess)
     {
         std::vector<std::string> cfg_nbr_tables = {CFG_NEIGH_TABLE_NAME};
+        enableDualTor();
         TestableNbrMgr nbrmgr(m_config_db.get(), m_app_db.get(), m_state_db.get(), cfg_nbr_tables);
         mockExecResult = 2;
         processFailedNeighborRequest(nbrmgr, "Vlan1000:2001:db8::4");
@@ -420,6 +430,7 @@ namespace nbrmgr_ut
     TEST_F(NbrMgrTest, SolicitationExecutionFailureRetries)
     {
         std::vector<std::string> cfg_nbr_tables = {CFG_NEIGH_TABLE_NAME};
+        enableDualTor();
         TestableNbrMgr nbrmgr(m_config_db.get(), m_app_db.get(), m_state_db.get(), cfg_nbr_tables);
         mockExecResult = 1;
         processFailedNeighborRequest(nbrmgr, "Vlan1000:2001:db8::5");
@@ -444,6 +455,7 @@ namespace nbrmgr_ut
     TEST_F(NbrMgrTest, RejectsIpv4FailedNeighborRequest)
     {
         std::vector<std::string> cfg_nbr_tables = {CFG_NEIGH_TABLE_NAME};
+        enableDualTor();
         TestableNbrMgr nbrmgr(m_config_db.get(), m_app_db.get(), m_state_db.get(), cfg_nbr_tables);
         processFailedNeighborRequest(nbrmgr, "Vlan1000:192.0.2.1");
 
@@ -454,6 +466,7 @@ namespace nbrmgr_ut
     TEST_F(NbrMgrTest, RejectsMalformedFailedNeighborRequest)
     {
         std::vector<std::string> cfg_nbr_tables = {CFG_NEIGH_TABLE_NAME};
+        enableDualTor();
         TestableNbrMgr nbrmgr(m_config_db.get(), m_app_db.get(), m_state_db.get(), cfg_nbr_tables);
         processFailedNeighborRequest(nbrmgr, "invalid-key");
 
@@ -464,11 +477,20 @@ namespace nbrmgr_ut
     TEST_F(NbrMgrTest, RejectsEmptyInterfaceFailedNeighborRequest)
     {
         std::vector<std::string> cfg_nbr_tables = {CFG_NEIGH_TABLE_NAME};
+        enableDualTor();
         TestableNbrMgr nbrmgr(m_config_db.get(), m_app_db.get(), m_state_db.get(), cfg_nbr_tables);
         processFailedNeighborRequest(nbrmgr, ":2001:db8::6");
 
         EXPECT_TRUE(capturedNeighborRequests.empty());
         EXPECT_TRUE(mockCallArgs.empty());
         EXPECT_FALSE(hasPendingFailedNeighborTask(nbrmgr));
+    }
+
+    TEST_F(NbrMgrTest, DoesNotSubscribeToFailedNeighborTableOnNonDualTor)
+    {
+        std::vector<std::string> cfg_nbr_tables = {CFG_NEIGH_TABLE_NAME};
+        TestableNbrMgr nbrmgr(m_config_db.get(), m_app_db.get(), m_state_db.get(), cfg_nbr_tables);
+
+        EXPECT_EQ(nbrmgr.getExecutor(APP_NEIGH_FAILED_TABLE_NAME), nullptr);
     }
 }
