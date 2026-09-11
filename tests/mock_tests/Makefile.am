@@ -418,7 +418,8 @@ tests_nbrmgrd_CPPFLAGS = $(DBGFLAGS) $(AM_CFLAGS) $(CFLAGS_COMMON) $(CFLAGS_GTES
 tests_nbrmgrd_CXXFLAGS = -Wl,-wrap,nl_socket_alloc -Wl,-wrap,nl_socket_free \
         -Wl,-wrap,nl_connect -Wl,-wrap,nl_send_auto -Wl,-wrap,nl_wait_for_ack \
         -Wl,-wrap,nl_socket_disable_auto_ack -Wl,-wrap,nl_socket_get_fd \
-        -Wl,-wrap,setsockopt -Wl,-wrap,if_nametoindex -Wl,-wrap,nlmsg_alloc
+        -Wl,-wrap,setsockopt -Wl,-wrap,__setsockopt64 \
+        -Wl,-wrap,if_nametoindex -Wl,-wrap,nlmsg_alloc
 tests_nbrmgrd_LDADD = $(LDADD_GTEST) $(LDADD_SAI) -lnl-genl-3 -lhiredis -lhiredis \
         -lswsscommon -lswsscommon -lgtest -lgtest_main -lzmq -lnl-3 -lnl-route-3 -lpthread -lgmock -lgmock_main
 

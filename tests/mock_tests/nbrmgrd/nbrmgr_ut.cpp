@@ -108,8 +108,8 @@ int __wrap_nl_socket_get_fd(const struct nl_sock *sk)
     return 42;
 }
 
-int __wrap_setsockopt(int socket, int level, int optionName,
-                      const void *optionValue, socklen_t optionLength)
+static int mockSetsockopt(int socket, int level, int optionName,
+                          const void *optionValue, socklen_t optionLength)
 {
     if (level == SOL_SOCKET && optionName == SO_RCVTIMEO &&
         optionLength == sizeof(struct timeval))
@@ -118,6 +118,18 @@ int __wrap_setsockopt(int socket, int level, int optionName,
         mockAckTimeoutConfigured = true;
     }
     return 0;
+}
+
+int __wrap_setsockopt(int socket, int level, int optionName,
+                      const void *optionValue, socklen_t optionLength)
+{
+    return mockSetsockopt(socket, level, optionName, optionValue, optionLength);
+}
+
+int __wrap___setsockopt64(int socket, int level, int optionName,
+                          const void *optionValue, socklen_t optionLength)
+{
+    return mockSetsockopt(socket, level, optionName, optionValue, optionLength);
 }
 
 /* Control whether nlmsg_alloc returns NULL to simulate setNeighbor failure */
