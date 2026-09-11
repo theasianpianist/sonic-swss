@@ -109,7 +109,7 @@ class NeighSyncTest : public ::testing::Test
         m_configDb = std::make_shared<DBConnector>("CONFIG_DB", 0);
         m_pipeline = std::make_shared<RedisPipeline>(m_appDb.get());
         m_sync = std::make_unique<NeighSync>(
-            m_pipeline.get(), m_stateDb.get(), m_configDb.get(), m_appDb.get());
+            m_pipeline.get(), m_stateDb.get(), m_configDb.get());
     }
 
     void enableDualTor()
