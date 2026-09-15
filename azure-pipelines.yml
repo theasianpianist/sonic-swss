@@ -27,6 +27,14 @@ schedules:
     - 201???
   always: true
 
+resources:
+  repositories:
+  - repository: sonic_swss_common
+    type: github
+    name: sonic-net/sonic-swss-common
+    endpoint: sonic-net
+    ref: refs/heads/$(BUILD_BRANCH)
+
 parameters:
   - name: debian_version
     type: string

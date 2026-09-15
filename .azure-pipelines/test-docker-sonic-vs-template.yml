@@ -85,6 +85,11 @@ jobs:
   - checkout: ${{ parameters.repo }}
     clean: true
 
+  # Compile-time resource ref (resolved above from BUILD_BRANCH) fails the run
+  # up front if the branch doesn't exist, instead of discovering it at runtime.
+  - checkout: sonic_swss_common
+    clean: true
+
   - ${{ if eq(parameters.repo, 'self') }}:
     - template: merge-target-branch.yml
 
@@ -104,45 +109,19 @@ jobs:
   - script: |
       set -ex
       sudo apt-get update
-      sudo apt-get install -y python3-yaml python3-requests git jq
-
-      clone_swss_common() {
-        ref="$1"
-        for delay in 0 5 15; do
-          [ "$delay" -eq 0 ] || sleep "$delay"
-          rm -rf /tmp/sw-common
-          git clone --depth 1 --branch "$ref" \
-            https://github.com/sonic-net/sonic-swss-common /tmp/sw-common && return 0
-        done
-        return 1
-      }
-
-      SETUP_BRANCH="$(BUILD_BRANCH)"
-      if ! clone_swss_common "$SETUP_BRANCH"; then
-        case "$(BUILD_BRANCH)" in
-          master|20[0-9][0-9][0-9][0-9])
-            echo "Failed to clone required sonic-swss-common branch $(BUILD_BRANCH)" >&2
-            exit 1
-            ;;
-          *)
-            echo "No matching swss-common feature branch; falling back to master"
-            clone_swss_common master
-            SETUP_BRANCH=master
-            ;;
-        esac
-      fi
+      sudo apt-get install -y python3-yaml python3-requests jq
 
       REQ_ARGS=$(echo "$STAGED_UPSTREAMS_JSON" \
         | jq -r '.[] | .name' \
         | xargs -I{} echo --required-staged-upstream {} \
         | tr '\n' ' ')
-      PYTHONPATH=/tmp/sw-common/ci python3 -m buildenv_setup \
+      PYTHONPATH=$(Pipeline.Workspace)/sonic_swss_common/ci python3 -m buildenv_setup \
         --repo-dir $(Build.SourcesDirectory) \
         --scope test \
         --arch amd64 \
         --debian-version ${{ parameters.debian_version }} \
         --host-os ubuntu-22.04 \
-        --branch "$SETUP_BRANCH" \
+        --branch "$(BUILD_BRANCH)" \
         --upstream-staged-dir $(Pipeline.Workspace)/staged \
         $REQ_ARGS
     displayName: "Set up VS test host (buildenv_setup)"
