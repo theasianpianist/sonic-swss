@@ -71,6 +71,12 @@ jobs:
   # Compile-time resource ref (resolved above from BUILD_BRANCH) fails the run
   # up front if the branch doesn't exist, instead of discovering it at runtime.
   - checkout: sonic_swss_common
+    # Explicit deterministic path: Azure's default (unset path) names the
+    # directory after the repo, not the resource alias, and nests it under
+    # whatever base path the caller's own checkout used (e.g. "s" or
+    # "s/sonic-swss"). Pin it so PYTHONPATH below is reliable regardless of
+    # caller context.
+    path: s/sonic-swss-common
     clean: true
 
   - ${{ if eq(parameters.repo, 'self') }}:
@@ -92,7 +98,7 @@ jobs:
         | jq -r '.[] | .name' \
         | xargs -I{} echo --required-staged-upstream {} \
         | tr '\n' ' ')
-      PYTHONPATH=$(Pipeline.Workspace)/sonic_swss_common/ci python3 -m buildenv_setup \
+      PYTHONPATH=$(Pipeline.Workspace)/s/sonic-swss-common/ci python3 -m buildenv_setup \
         --repo-dir $(Build.SourcesDirectory) \
         --scope build \
         --arch ${{ parameters.arch }} \
