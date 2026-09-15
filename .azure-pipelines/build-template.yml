@@ -68,8 +68,15 @@ jobs:
     clean: true
     submodules: true
 
+  - ${{ if eq(parameters.repo, 'self') }}:
+    - template: merge-target-branch.yml
+
   # Compile-time resource ref (resolved above from BUILD_BRANCH) fails the run
   # up front if the branch doesn't exist, instead of discovering it at runtime.
+  # Must come AFTER merge-target-branch.yml: additional checkout steps move
+  # System.DefaultWorkingDirectory (the implicit cwd for script steps without
+  # an explicit workingDirectory) to the most-recently-checked-out repo, and
+  # merge-target-branch.yml relies on that still being the "self" checkout.
   - checkout: sonic_swss_common
     # Explicit deterministic path: Azure's default (unset path) names the
     # directory after the repo, not the resource alias, and nests it under
@@ -78,9 +85,6 @@ jobs:
     # caller context.
     path: s/sonic-swss-common
     clean: true
-
-  - ${{ if eq(parameters.repo, 'self') }}:
-    - template: merge-target-branch.yml
 
   - ${{ each up in parameters.staged_upstreams }}:
     - task: DownloadPipelineArtifact@2
