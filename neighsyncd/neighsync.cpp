@@ -244,7 +244,7 @@ void NeighSync::onMsg(int nlmsg_type, struct nl_object *obj)
                 FieldValueTuple("NULL", "NULL"),
             };
             m_kernelFailedNeighTable.set(key, failedNeighFields);
-            SWSS_LOG_NOTICE("Published failed kernel neighbor '%s' for nbrmgrd processing", key.c_str());
+            SWSS_LOG_INFO("Published failed kernel neighbor '%s' for nbrmgrd processing", key.c_str());
         }
         else if (nlmsg_type == RTM_DELNEIGH ||
                  ((nlmsg_type == RTM_NEWNEIGH || nlmsg_type == RTM_GETNEIGH) &&
@@ -254,8 +254,8 @@ void NeighSync::onMsg(int nlmsg_type, struct nl_object *obj)
             if (m_kernelFailedNeighCheckTable.get(key, failedNeighFields))
             {
                 m_kernelFailedNeighTable.del(key);
-                SWSS_LOG_NOTICE("Removed resolved or deleted kernel neighbor '%s' from failed neighbor table",
-                                key.c_str());
+                SWSS_LOG_INFO("Removed resolved or deleted kernel neighbor '%s' from failed neighbor table",
+                              key.c_str());
             }
         }
     }
