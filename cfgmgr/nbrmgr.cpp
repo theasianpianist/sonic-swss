@@ -391,7 +391,7 @@ void NbrMgr::processKernelFailedNeighbor(const string& key, const string& tableS
 
         if (!sendNeighborSolicitation(alias, ip))
         {
-            SWSS_LOG_WARN("Moved kernel neighbor '%s' to INCOMPLETE but failed to execute ndisc6",
+            SWSS_LOG_INFO("Moved kernel neighbor '%s' to INCOMPLETE but failed to execute ndisc6",
                           key.c_str());
             return;
         }
