@@ -65,6 +65,13 @@ jobs:
 
   steps:
   - checkout: ${{ parameters.repo }}
+    # Explicit path: once a second checkout (sonic_swss_common) exists in this
+    # job, Azure Pipelines stops using its historical "s" default for self and
+    # names every checkout after its repo (e.g. "s/sonic-swss") instead — but
+    # Build.SourcesDirectory/System.DefaultWorkingDirectory still assume the
+    # old "s" default, breaking merge-target-branch.yml and anything else that
+    # relies on the implicit cwd. Pin it so those variables stay correct.
+    path: s
     clean: true
     submodules: true
 
