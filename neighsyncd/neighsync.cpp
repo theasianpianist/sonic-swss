@@ -152,8 +152,6 @@ void NeighSync::onMsg(int nlmsg_type, struct nl_object *obj)
         }
     }
 
-    SWSS_LOG_INFO("Get neighbor msg %s, state %d, type %d", ipStr, state, nlmsg_type);
-
     bool delete_key = false;
     bool use_zero_mac = false;
     if (is_dualtor && (state == NUD_INCOMPLETE || state == NUD_FAILED))
