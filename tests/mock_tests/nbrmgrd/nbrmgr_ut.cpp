@@ -381,7 +381,7 @@ namespace nbrmgr_ut
         EXPECT_FALSE(hasPendingFailedNeighborTask(nbrmgr));
     }
 
-    TEST_F(NbrMgrTest, NetlinkSendFailureRetries)
+    TEST_F(NbrMgrTest, NetlinkSendFailureIsBestEffort)
     {
         std::vector<std::string> cfg_nbr_tables = {CFG_NEIGH_TABLE_NAME};
         enableDualTor();
@@ -392,17 +392,10 @@ namespace nbrmgr_ut
         ASSERT_EQ(capturedNeighborRequests.size(), 1u);
         EXPECT_TRUE(mockCallArgs.empty());
         EXPECT_EQ(operationOrder, (std::vector<std::string>{"netlink"}));
-        EXPECT_TRUE(hasPendingFailedNeighborTask(nbrmgr));
-
-        mockNlSendResult = 0;
-        nbrmgr.doTask();
-
-        EXPECT_EQ(operationOrder,
-                  (std::vector<std::string>{"netlink", "netlink", "ack", "ndisc6"}));
         EXPECT_FALSE(hasPendingFailedNeighborTask(nbrmgr));
     }
 
-    TEST_F(NbrMgrTest, NetlinkAckTimeoutRetries)
+    TEST_F(NbrMgrTest, NetlinkAckTimeoutIsBestEffort)
     {
         std::vector<std::string> cfg_nbr_tables = {CFG_NEIGH_TABLE_NAME};
         enableDualTor();
@@ -412,18 +405,9 @@ namespace nbrmgr_ut
 
         EXPECT_EQ(operationOrder, (std::vector<std::string>{"netlink", "ack"}));
         EXPECT_TRUE(mockCallArgs.empty());
-        EXPECT_TRUE(hasPendingFailedNeighborTask(nbrmgr));
+        EXPECT_FALSE(hasPendingFailedNeighborTask(nbrmgr));
         EXPECT_EQ(mockNlSocketAllocCount, 2);
         EXPECT_EQ(mockNlSocketFreeCount, 1);
-
-        mockNlAckResult = 0;
-        nbrmgr.doTask();
-
-        EXPECT_EQ(operationOrder,
-                  (std::vector<std::string>{"netlink", "ack", "netlink", "ack", "ndisc6"}));
-        EXPECT_FALSE(hasPendingFailedNeighborTask(nbrmgr));
-        EXPECT_EQ(mockNlSocketAllocCount, 3);
-        EXPECT_EQ(mockNlSocketFreeCount, 2);
     }
 
     TEST_F(NbrMgrTest, NoSolicitationResponseIsSuccess)
@@ -439,7 +423,7 @@ namespace nbrmgr_ut
         EXPECT_FALSE(hasPendingFailedNeighborTask(nbrmgr));
     }
 
-    TEST_F(NbrMgrTest, SolicitationExecutionFailureRetries)
+    TEST_F(NbrMgrTest, SolicitationExecutionFailureIsBestEffort)
     {
         std::vector<std::string> cfg_nbr_tables = {CFG_NEIGH_TABLE_NAME};
         enableDualTor();
@@ -449,18 +433,6 @@ namespace nbrmgr_ut
 
         EXPECT_EQ(capturedNeighborRequests.size(), 1u);
         EXPECT_EQ(mockCallArgs.size(), 1u);
-        EXPECT_TRUE(hasPendingFailedNeighborTask(nbrmgr));
-
-        mockExecResult = 0;
-        nbrmgr.doTask();
-
-        EXPECT_EQ(capturedNeighborRequests.size(), 2u);
-        EXPECT_EQ(mockCallArgs.size(), 2u);
-        EXPECT_EQ(operationOrder,
-                  (std::vector<std::string>{
-                      "netlink", "ack", "ndisc6",
-                      "netlink", "ack", "ndisc6",
-                  }));
         EXPECT_FALSE(hasPendingFailedNeighborTask(nbrmgr));
     }
 

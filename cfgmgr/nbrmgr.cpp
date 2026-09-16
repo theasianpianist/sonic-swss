@@ -357,14 +357,14 @@ bool NbrMgr::sendNeighborSolicitation(const string& alias, const IpAddress& ip)
     return false;
 }
 
-task_process_status NbrMgr::processKernelFailedNeighbor(const string& key, const string& tableSeparator)
+void NbrMgr::processKernelFailedNeighbor(const string& key, const string& tableSeparator)
 {
     try
     {
         if (key.find(tableSeparator) == string::npos)
         {
             SWSS_LOG_ERROR("Invalid failed kernel neighbor entry '%s'", key.c_str());
-            return task_invalid_entry;
+            return;
         }
 
         vector<string> parsedKeys = parseAliasIp(key, tableSeparator.c_str());
@@ -374,35 +374,33 @@ task_process_status NbrMgr::processKernelFailedNeighbor(const string& key, const
         if (alias.empty())
         {
             SWSS_LOG_ERROR("Invalid empty interface in failed kernel neighbor entry '%s'", key.c_str());
-            return task_invalid_entry;
+            return;
         }
 
         if (ip.isV4())
         {
             SWSS_LOG_ERROR("Ignoring non-IPv6 failed kernel neighbor '%s'", key.c_str());
-            return task_invalid_entry;
+            return;
         }
 
         if (!setFailedNeighborIncomplete(alias, ip))
         {
-            SWSS_LOG_ERROR("Failed to move kernel neighbor '%s' to INCOMPLETE, retrying", key.c_str());
-            return task_need_retry;
+            SWSS_LOG_ERROR("Failed to move kernel neighbor '%s' to INCOMPLETE", key.c_str());
+            return;
         }
 
         if (!sendNeighborSolicitation(alias, ip))
         {
-            SWSS_LOG_WARN("Moved kernel neighbor '%s' to INCOMPLETE but failed to execute ndisc6, retrying",
+            SWSS_LOG_WARN("Moved kernel neighbor '%s' to INCOMPLETE but failed to execute ndisc6",
                           key.c_str());
-            return task_need_retry;
+            return;
         }
 
-        SWSS_LOG_NOTICE("Moved kernel neighbor '%s' to INCOMPLETE and sent one NS", key.c_str());
-        return task_success;
+        SWSS_LOG_INFO("Moved kernel neighbor '%s' to INCOMPLETE and sent one NS", key.c_str());
     }
     catch (const std::invalid_argument& e)
     {
         SWSS_LOG_ERROR("Failed to process kernel neighbor '%s': %s", key.c_str(), e.what());
-        return task_invalid_entry;
     }
 }
 
@@ -517,12 +515,7 @@ void NbrMgr::doKernelFailedNeighTask(Consumer& consumer)
         KeyOpFieldsValuesTuple t = it->second;
         if (kfvOp(t) == SET_COMMAND)
         {
-            task_process_status status = processKernelFailedNeighbor(kfvKey(t), tableSeparator);
-            if (status == task_need_retry)
-            {
-                it++;
-                continue;
-            }
+            processKernelFailedNeighbor(kfvKey(t), tableSeparator);
         }
 
         it = consumer.m_toSync.erase(it);
