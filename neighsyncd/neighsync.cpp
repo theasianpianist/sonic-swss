@@ -24,7 +24,7 @@ using namespace swss;
 #define TENMS                   10000
 #define MAX_ROUTE_DEL_RETRY     100
 
-static constexpr int RESOLVED_NEIGH_STATES =
+static constexpr int VALID_NEIGH_STATES =
     NUD_PERMANENT | NUD_NOARP | NUD_REACHABLE | NUD_PROBE | NUD_STALE | NUD_DELAY;
 
 NeighSync::NeighSync(RedisPipeline *pipelineAppDB, DBConnector *stateDb, DBConnector *cfgDb, DBConnector *appDb) :
@@ -248,7 +248,7 @@ void NeighSync::onMsg(int nlmsg_type, struct nl_object *obj)
         }
         else if (nlmsg_type == RTM_DELNEIGH ||
                  ((nlmsg_type == RTM_NEWNEIGH || nlmsg_type == RTM_GETNEIGH) &&
-                  (state & RESOLVED_NEIGH_STATES)))
+                  (state & VALID_NEIGH_STATES)))
         {
             std::vector<FieldValueTuple> failedNeighFields;
             if (m_kernelFailedNeighCheckTable.get(key, failedNeighFields))
