@@ -110,6 +110,12 @@ jobs:
     path: s/sonic-swss-common
     clean: true
 
+  - script: |
+      set -ex
+      sudo rm -rf /tmp/sw-common
+      sudo ln -s "$(Pipeline.Workspace)/s/sonic-swss-common" /tmp/sw-common
+    displayName: "Expose sonic-swss-common at /tmp/sw-common"
+
   - ${{ each up in parameters.staged_upstreams }}:
     - task: DownloadPipelineArtifact@2
       inputs:
