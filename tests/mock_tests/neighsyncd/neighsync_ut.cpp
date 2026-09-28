@@ -118,6 +118,15 @@ class NeighSyncTest : public ::testing::Test
         peerSwitchTable.set("peer_switch_hostname", {{"address_ipv4", "10.0.0.1"}});
     }
 
+    void configureVlanSubnet(
+        const std::string& prefix, const std::string& interface = "lo")
+    {
+        Table vlanInterfaceTable(m_configDb.get(), CFG_VLAN_INTF_TABLE_NAME);
+        const std::string key =
+            interface + vlanInterfaceTable.getTableNameSeparator() + prefix;
+        vlanInterfaceTable.set(key, {{"NULL", "NULL"}});
+    }
+
     bool failedNeighborExists(const std::string& ip, std::vector<FieldValueTuple>* fields = nullptr)
     {
         Table failedNeighborTable(m_appDb.get(), APP_NEIGH_FAILED_TABLE_NAME);
@@ -153,6 +162,7 @@ class NeighSyncTest : public ::testing::Test
 TEST_F(NeighSyncTest, PublishesDualTorFailedIpv6Neighbor)
 {
     enableDualTor();
+    configureVlanSubnet("2001:db8::1/64");
     auto neigh = createNeighbor(AF_INET6, "2001:db8::1", NUD_FAILED);
     ASSERT_TRUE(neigh.get() != nullptr);
     EXPECT_EQ(rtnl_neigh_get_family(neigh.get()), AF_INET6);
@@ -175,6 +185,7 @@ TEST_F(NeighSyncTest, PublishesDualTorFailedIpv6Neighbor)
 TEST_F(NeighSyncTest, FiltersUnsupportedFailedNeighborEvents)
 {
     enableDualTor();
+    configureVlanSubnet("2001:db8::1/64");
 
     auto ipv4 = createNeighbor(AF_INET, "192.0.2.1", NUD_FAILED);
     ASSERT_TRUE(ipv4.get() != nullptr);
@@ -191,6 +202,7 @@ TEST_F(NeighSyncTest, FiltersUnsupportedFailedNeighborEvents)
 TEST_F(NeighSyncTest, KeepsFailedNeighborEntryWhileIncomplete)
 {
     enableDualTor();
+    configureVlanSubnet("2001:db8::1/64");
     auto failed = createNeighbor(AF_INET6, "2001:db8::3", NUD_FAILED);
     ASSERT_TRUE(failed.get() != nullptr);
     m_sync->onMsg(RTM_NEWNEIGH, reinterpret_cast<struct nl_object *>(failed.get()));
@@ -206,6 +218,7 @@ TEST_F(NeighSyncTest, KeepsFailedNeighborEntryWhileIncomplete)
 TEST_F(NeighSyncTest, RemovesFailedNeighborEntryWhenResolved)
 {
     enableDualTor();
+    configureVlanSubnet("2001:db8::1/64");
     auto failed = createNeighbor(AF_INET6, "2001:db8::4", NUD_FAILED);
     ASSERT_TRUE(failed.get() != nullptr);
     m_sync->onMsg(RTM_NEWNEIGH, reinterpret_cast<struct nl_object *>(failed.get()));
@@ -221,6 +234,7 @@ TEST_F(NeighSyncTest, RemovesFailedNeighborEntryWhenResolved)
 TEST_F(NeighSyncTest, RemovesFailedNeighborEntryWhenDeleted)
 {
     enableDualTor();
+    configureVlanSubnet("2001:db8::1/64");
     auto failed = createNeighbor(AF_INET6, "2001:db8::5", NUD_FAILED);
     ASSERT_TRUE(failed.get() != nullptr);
     m_sync->onMsg(RTM_NEWNEIGH, reinterpret_cast<struct nl_object *>(failed.get()));
@@ -235,12 +249,51 @@ TEST_F(NeighSyncTest, RemovesFailedNeighborEntryWhenDeleted)
 
 TEST_F(NeighSyncTest, DoesNotPublishFailedIpv6NeighborWithoutDualTor)
 {
+    configureVlanSubnet("2001:db8::1/64");
     auto neigh = createNeighbor(AF_INET6, "2001:db8::6", NUD_FAILED);
     ASSERT_TRUE(neigh.get() != nullptr);
 
     m_sync->onMsg(RTM_NEWNEIGH, reinterpret_cast<struct nl_object *>(neigh.get()));
 
     EXPECT_FALSE(failedNeighborExists("2001:db8::6"));
+}
+
+TEST_F(NeighSyncTest, DoesNotPublishFailedIpv6NeighborOutsideVlanSubnet)
+{
+    enableDualTor();
+    configureVlanSubnet("2001:db8:1::1/64");
+    auto neigh = createNeighbor(AF_INET6, "2001:db8:2::1", NUD_FAILED);
+    ASSERT_TRUE(neigh.get() != nullptr);
+
+    m_sync->onMsg(RTM_NEWNEIGH, reinterpret_cast<struct nl_object *>(neigh.get()));
+
+    EXPECT_FALSE(failedNeighborExists("2001:db8:2::1"));
+}
+
+TEST_F(NeighSyncTest, DoesNotPublishFailedIpv6NeighborOnDifferentVlanInterface)
+{
+    enableDualTor();
+    configureVlanSubnet("2001:db8::1/64", "Vlan1000");
+    auto neigh = createNeighbor(AF_INET6, "2001:db8::7", NUD_FAILED);
+    ASSERT_TRUE(neigh.get() != nullptr);
+
+    m_sync->onMsg(RTM_NEWNEIGH, reinterpret_cast<struct nl_object *>(neigh.get()));
+
+    EXPECT_FALSE(failedNeighborExists("2001:db8::7"));
+}
+
+TEST_F(NeighSyncTest, RemovesStaleFailedNeighborOutsideVlanSubnet)
+{
+    enableDualTor();
+    Table failedNeighborTable(m_appDb.get(), APP_NEIGH_FAILED_TABLE_NAME);
+    failedNeighborTable.set("lo:2001:db8:3::1", {{"NULL", "NULL"}});
+    ASSERT_TRUE(failedNeighborExists("2001:db8:3::1"));
+
+    auto neigh = createNeighbor(AF_INET6, "2001:db8:3::1", NUD_FAILED);
+    ASSERT_TRUE(neigh.get() != nullptr);
+    m_sync->onMsg(RTM_NEWNEIGH, reinterpret_cast<struct nl_object *>(neigh.get()));
+
+    EXPECT_FALSE(failedNeighborExists("2001:db8:3::1"));
 }
 
 } // namespace
