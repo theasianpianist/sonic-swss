@@ -8,7 +8,6 @@
 #include "dbconnector.h"
 #include "producerstatetable.h"
 #include "ipaddress.h"
-#include "ipprefix.h"
 #include "netmsg.h"
 #include "linkcache.h"
 #include "macaddress.h"
@@ -27,36 +26,6 @@ using namespace swss;
 
 static constexpr int VALID_NEIGH_STATES =
     NUD_PERMANENT | NUD_NOARP | NUD_REACHABLE | NUD_PROBE | NUD_STALE | NUD_DELAY;
-
-static bool isIpInConfiguredVlanSubnet(
-    Table& vlanInterfaceTable, const string& interface, const IpAddress& ip)
-{
-    vector<string> keys;
-    vlanInterfaceTable.getKeys(keys);
-
-    const string keyPrefix = interface + vlanInterfaceTable.getTableNameSeparator();
-    for (const auto& key : keys)
-    {
-        if (key.compare(0, keyPrefix.size(), keyPrefix) != 0)
-        {
-            continue;
-        }
-
-        try
-        {
-            if (IpPrefix(key.substr(keyPrefix.size())).isAddressInSubnet(ip))
-            {
-                return true;
-            }
-        }
-        catch (const invalid_argument& e)
-        {
-            SWSS_LOG_ERROR("Invalid VLAN interface prefix '%s': %s", key.c_str(), e.what());
-        }
-    }
-
-    return false;
-}
 
 NeighSync::NeighSync(RedisPipeline *pipelineAppDB, DBConnector *stateDb, DBConnector *cfgDb, DBConnector *appDb) :
     m_neighTable(pipelineAppDB, APP_NEIGH_TABLE_NAME),
@@ -271,7 +240,7 @@ void NeighSync::onMsg(int nlmsg_type, struct nl_object *obj)
     {
         if (nlmsg_type == RTM_NEWNEIGH && state == NUD_FAILED)
         {
-            if (isIpInConfiguredVlanSubnet(m_cfgVlanInterfaceTable, intfName, ipAddress))
+            if (!intfName.compare(0, strlen("Vlan"), "Vlan"))
             {
                 std::vector<FieldValueTuple> failedNeighFields = {
                     FieldValueTuple("NULL", "NULL"),
@@ -282,8 +251,7 @@ void NeighSync::onMsg(int nlmsg_type, struct nl_object *obj)
             else
             {
                 m_kernelFailedNeighTable.del(key);
-                SWSS_LOG_INFO("Ignoring failed kernel neighbor '%s' outside configured VLAN subnet",
-                              key.c_str());
+                SWSS_LOG_INFO("Ignoring failed kernel neighbor '%s' on non-VLAN interface", key.c_str());
             }
         }
         else if (nlmsg_type == RTM_DELNEIGH ||
