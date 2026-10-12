@@ -9,8 +9,8 @@ upstream:
   # SWSS directly requires the SONiC-patched libnl headers on every
   # architecture (for example rtnl_route_get_nh_id). Keep this entry before
   # sonic-sairedis: the cascade deduplicates upstreams by name, so this superset
-  # replaces sairedis's nested common-libs selection (which intentionally uses
-  # stock apt libnl on ARM) while retaining its libyang requirements.
+  # provides the complete libnl family required by swss-common/sairedis while
+  # retaining their libyang requirements.
   - name: common-libs
     project: build
     pipeline: Azure.sonic-buildimage.common_libs
@@ -22,14 +22,16 @@ upstream:
       - { when: { arch: amd64 },          value: 'common-lib' }
       - { when: { arch: { not: amd64 } }, value: 'common-lib.{arch}' }
     debs:
-      - { path: 'target/debs/{debian_version}/libnl-3-200_*.deb',       scopes: [build] }
+      - { path: 'target/debs/{debian_version}/libnl-3-200_*.deb',       scopes: [build, test] }
       - { path: 'target/debs/{debian_version}/libnl-3-dev_*.deb',       scopes: [build] }
-      - { path: 'target/debs/{debian_version}/libnl-genl-3-200_*.deb',  scopes: [build] }
+      - { path: 'target/debs/{debian_version}/libnl-genl-3-200_*.deb',  scopes: [build, test] }
       - { path: 'target/debs/{debian_version}/libnl-genl-3-dev_*.deb',  scopes: [build] }
-      - { path: 'target/debs/{debian_version}/libnl-route-3-200_*.deb', scopes: [build] }
+      - { path: 'target/debs/{debian_version}/libnl-route-3-200_*.deb', scopes: [build, test] }
       - { path: 'target/debs/{debian_version}/libnl-route-3-dev_*.deb', scopes: [build] }
-      - { path: 'target/debs/{debian_version}/libnl-nf-3-200_*.deb',    scopes: [build] }
+      - { path: 'target/debs/{debian_version}/libnl-nf-3-200_*.deb',    scopes: [build, test] }
       - { path: 'target/debs/{debian_version}/libnl-nf-3-dev_*.deb',    scopes: [build] }
+      - { path: 'target/debs/{debian_version}/libnl-cli-3-200_*.deb',   scopes: [build, test] }
+      - { path: 'target/debs/{debian_version}/libnl-cli-3-dev_*.deb',   scopes: [build] }
       - 'target/debs/{debian_version}/libyang3_*.deb'
       - 'target/debs/{debian_version}/libyang-dev_3*.deb'
 
